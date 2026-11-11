@@ -13,7 +13,6 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import config, db
-from .ai import phone as phone_ai
 from .paypal import service as pp
 from .paypal.client import PayPalError
 
@@ -150,23 +149,19 @@ def callback(request: Request, code: str | None = None, state: str | None = None
     # with only the openid scope PayPal returns just user_id, so use it as the account key
     account = payer_id or (str(info.get("user_id") or "").rstrip("/").split("/")[-1] or None)
     verified = str(info.get("verified_account", "")).lower() == "true"
-    saved = db.phone_for_payer(account) if account else None
+    saved = (db.email_for_payer(account) or db.phone_for_payer(account)) if account else None
     if saved and not email:
         email, name = saved.get("email"), saved.get("name") or name
-    phone, phone_source = None, None
-    paypal_phone = phone_ai.normalize(str(info.get("phone_number") or "")) if info.get("phone_number") else None
-    if paypal_phone and account:
-        # number comes from the PayPal profile, so link it
-        db.link_phone(paypal_phone, account, name, email, verified, "paypal")
-        phone, phone_source = paypal_phone, "paypal"
-    elif saved:
-        phone, phone_source = saved["phone"], saved["source"]
+    if email and account and config.settings.email_allowed(email):
+        # where other users' payments reach this account; an email PayPal shared always wins
+        db.link_email(email, account, name, verified, "paypal" if info.get("emails") else (saved or {}).get("source") or "user")
+    country = str((info.get("address") or {}).get("country") or "").upper() or None
     addr = info.get("address") or {}
     # city and country only: no street address in the session
     place = ", ".join(x for x in (addr.get("locality"), addr.get("region"), addr.get("country")) if x) or None
     request.session["user"] = {
         "name": name, "email": email, "payer_id": payer_id, "account": account, "verified": verified,
-        "phone": phone, "phone_source": phone_source, "address": place,
+        "phone": None, "phone_source": None, "address": place, "country": country,
         "exp": int(time.time()) + config.settings.session_hours * 3600, "seen": int(time.time()), "sv": _version(account),
     }
     return RedirectResponse(home + "/", status_code=302)
@@ -180,33 +175,31 @@ def me(request: Request) -> dict[str, Any]:
     return {"user": user}
 
 
-class PhoneIn(BaseModel):
-    phone: str = Field(min_length=4, max_length=32)
-    email: str | None = Field(default=None, max_length=254)
+class PayoutIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
     name: str | None = Field(default=None, max_length=120)
+    phone: str | None = Field(default=None, max_length=32)  # ignored: PayMinute uses PayPal emails only
 
 
-@router.post("/phone")
-def set_my_phone(body: PhoneIn, request: Request) -> dict[str, Any]:
-    """Link your own number to your PayPal account when PayPal didn't share one at login."""
+@router.post("/payout")
+@router.post("/phone")  # older pages
+def set_my_payout_email(body: PayoutIn, request: Request) -> dict[str, Any]:
+    """Save your own PayPal email when PayPal didn't share it at login, so other users' payments reach you."""
     user = current_user(request)
     account = (user or {}).get("account") or (user or {}).get("payer_id")
     if not account:
         raise HTTPException(401, "Log in with PayPal first.")
-    if user.get("phone_source") == "paypal":
-        raise HTTPException(409, "Your number already comes from your PayPal profile. Change it on PayPal and log in again.")
-    e164 = phone_ai.normalize(body.phone)
-    if not e164:
-        raise HTTPException(400, "That phone number isn't valid. Include the country code.")
-    email = user.get("email") or (body.email or "").strip().lower() or None
-    if not email or "@" not in email:
-        raise HTTPException(400, "Add the email of your PayPal account so payments can reach you.")
+    email = (body.email or "").strip().lower()
+    if user.get("email") and email != user["email"].lower() and (db.find_email(user["email"]) or {}).get("source") == "paypal":
+        raise HTTPException(409, "Your PayPal email comes from your PayPal login. Change it on PayPal and log in again.")
+    if not config.settings.email_allowed(email):
+        raise HTTPException(400, f"Use the email of your PayPal sandbox account ({config.settings.email_rule}).")
+    owner = db.find_email(email)
+    if owner and owner["payer_id"] != account:
+        raise HTTPException(409, "That PayPal email belongs to another PayMinute account.")
     name = user.get("name") if user.get("name") not in {None, "", "PayPal user"} else (body.name or "").strip() or "PayPal user"
-    owner = db.find_phone(e164)
-    if owner and owner["payer_id"] != account and owner["source"] == "paypal":
-        raise HTTPException(409, "PayPal says this number belongs to another PayPal account.")
-    db.link_phone(e164, account, name, email, bool(user.get("verified")), "user")
-    user.update(phone=e164, phone_source="user", email=email, name=name)
+    db.link_email(email, account, name, bool(user.get("verified")), "user")
+    user.update(email=email, name=name, phone=None, phone_source=None)
     request.session["user"] = user
     return {"user": user}
 

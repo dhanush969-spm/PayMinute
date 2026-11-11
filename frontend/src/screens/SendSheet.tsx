@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { AtSign, BadgeCheck, CheckCircle2, CircleHelp, Lock, Phone, RefreshCw, SendHorizontal, ShieldAlert, ShieldCheck, Sparkles, UserX, X } from "lucide-react";
-import { api, ApiError, newRef, PhoneCheck, Risk, Tx } from "../api";
+import { AtSign, BadgeCheck, CheckCircle2, CircleHelp, Lock, RefreshCw, SendHorizontal, ShieldAlert, ShieldCheck, X } from "lucide-react";
+import { api, ApiError, emailAllowed, emailRule, newRef, Risk, Tx } from "../api";
 import { currencySymbol, money } from "../format";
 import { InsightCard, useApp } from "../components/ui";
 import { Errors, FieldError, FormAlert, amountError, collect, invalid, payeeError, report } from "../components/form";
@@ -9,40 +9,11 @@ import Avatar from "./Avatar";
 export interface SendPrefill { to?: string; name?: string; amount?: string; note?: string }
 
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const looksLikePhone = (v: string) => !v.includes("@") && (v.match(/\d/g)?.length ?? 0) >= 7;
 const TONE = {
   low: "bg-emerald-50 border-emerald-200 text-emerald-900",
   medium: "bg-amber-50 border-amber-200 text-amber-900",
   high: "bg-red-50 border-red-200 text-red-900",
 };
-
-// AI Guard result for a phone number
-function PhoneCard({ check }: { check: PhoneCheck }) {
-  const pp = check.paypal;
-  const PPIcon = pp.status === "verified" || pp.status === "linked" ? BadgeCheck : pp.status === "not_on_paypal" ? UserX : CircleHelp;
-  const ppTone = pp.status === "verified" ? "text-emerald-700" : pp.status === "linked" ? "text-[#1558b0]" : pp.status === "not_on_paypal" ? "text-red-700" : "text-slate-600";
-  return (
-    <div className={`p-3.5 rounded-2xl border text-sm space-y-2 ${check.valid && !check.payable && check.level === "low" ? TONE.medium : TONE[check.level]}`} aria-live="polite">
-      <div className="flex items-center gap-2">
-        {check.level === "low" ? <ShieldCheck className="w-4 h-4" /> : <ShieldAlert className="w-4 h-4" />}
-        <span>AI phone check · {!check.payable && check.valid ? "can't be paid yet" : check.level === "low" ? "looks fine" : check.level === "medium" ? "double-check" : "don't pay yet"}</span>
-      </div>
-      {check.valid ? (
-        <>
-          <div className="text-xs">{check.display} · {check.place} · {check.line_type}{check.network ? ` · ${check.network}` : ""}</div>
-          <div className={`flex items-start gap-1.5 text-xs bg-white/70 rounded-xl p-2 ${ppTone}`}>
-            <PPIcon className="w-4 h-4 shrink-0" />
-            <span><span className="text-black">PayPal: {pp.label}{pp.name ? ` (${pp.name})` : ""}.</span> {pp.detail}</span>
-          </div>
-        </>
-      ) : <div className="text-xs">{check.verdict}</div>}
-      {check.signals.length > 0 && (
-        <ul className="m-0 pl-4 text-xs space-y-0.5">{check.signals.map((s) => <li key={s.code}>{s.label}: {s.detail}</li>)}</ul>
-      )}
-      {check.ai_summary && <div className="text-xs flex gap-1.5"><Sparkles className="w-3.5 h-3.5 shrink-0 text-purple-700" /> {check.ai_summary}</div>}
-    </div>
-  );
-}
 
 export default function SendSheet({ open, prefill, onClose }: { open: boolean; prefill: SendPrefill; onClose: () => void }) {
   const { config, toast, bump } = useApp();
@@ -50,8 +21,6 @@ export default function SendSheet({ open, prefill, onClose }: { open: boolean; p
   const [name, setName] = useState("");
   const [amount, setAmount] = useState("");
   const [note, setNote] = useState("");
-  const [phone, setPhone] = useState<PhoneCheck | null>(null);
-  const [verifying, setVerifying] = useState(false);
   const [risk, setRisk] = useState<Risk | null>(null);
   const [checking, setChecking] = useState(false);
   const [blocker, setBlocker] = useState(false);
@@ -66,29 +35,15 @@ export default function SendSheet({ open, prefill, onClose }: { open: boolean; p
     if (!open) return;
     const t = prefill.to ?? "";
     setTo(t); setName(prefill.name ?? ""); setAmount(prefill.amount ?? ""); setNote(prefill.note ?? "");
-    setRisk(null); setPhone(null); setDone(null); setBlocker(false); setErr({}); setFailure(null); ref.current = newRef();
+    setRisk(null); setDone(null); setBlocker(false); setErr({}); setFailure(null); ref.current = newRef();
   }, [open, prefill]);
 
   const amt = parseFloat(amount);
   const receiver = to.trim();
-  // one box: a phone number or a PayPal account email, detected as you type
-  const byEmail = /[@a-z]/i.test(receiver);
-  const receiverOk = byEmail ? EMAIL.test(receiver) : looksLikePhone(receiver);
-  const phoneOk = byEmail || (phone?.payable ?? false);
-  const valid = receiverOk && phoneOk && amt > 0 && amt <= 20000;
-
-  // check the number as it's typed
-  useEffect(() => {
-    if (!open || byEmail || !looksLikePhone(receiver)) { setPhone(null); return; }
-    setVerifying(true);
-    const t = setTimeout(() => {
-      api.post<PhoneCheck>("/phone/verify", { phone: receiver, amount: amt > 0 ? amt : null })
-        .then((r) => { setPhone(r); if (r.paypal.name && !name) setName(r.paypal.name); })
-        .catch(() => setPhone(null)).finally(() => setVerifying(false));
-    }, 500);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, byEmail, receiver]);
+  // PayMinute pays PayPal sandbox emails only (…@personal.example.com)
+  const domains = config?.email_domains ?? ["personal.example.com"];
+  const receiverOk = EMAIL.test(receiver) && emailAllowed(receiver, domains);
+  const valid = receiverOk && amt > 0 && amt <= 20000;
 
   // then score the whole payment
   useEffect(() => {
@@ -122,14 +77,12 @@ export default function SendSheet({ open, prefill, onClose }: { open: boolean; p
     e.preventDefault();
     setFailure(null);
     const errors = collect({
-      to: payeeError(receiver) ?? (!byEmail && phone && !phone.valid ? "That phone number isn't valid. Include the country code, e.g. +1 408 555 0134."
-        : !byEmail && phone && !phone.payable ? "This number isn't linked to a PayPal account yet, so it can't be paid. Ask for their PayPal email instead." : null),
+      to: payeeError(receiver, domains),
       amount: amountError(amount),
     });
     setErr(errors);
     if (!report(errors, toast, formRef.current)) return;
-    if (verifying || checking) { toast("Still checking this payment with PayPal. Try again in a moment.", "error"); return; }
-    if (!byEmail && !phone) { toast("Couldn't verify this number with PayPal yet. Check it and try again.", "error"); return; }
+    if (checking) { toast("Still checking this payment. Try again in a moment.", "error"); return; }
     if (!valid) return;
     if (risk?.level === "high") { setBlocker(true); return; }
     send(false);
@@ -137,9 +90,9 @@ export default function SendSheet({ open, prefill, onClose }: { open: boolean; p
 
   if (!open) return null;
   const tone = risk ? TONE[risk.level] : "";
-  const shownTo = phone?.display || receiver;
-  const region = config?.phone_region ?? "US";
-  const placeholder = region === "IN" ? "Phone or PayPal email, e.g. +91 98450 12345" : "Phone or PayPal email, e.g. +1 408 555 0134";
+  const shownTo = receiver;
+  const placeholder = `PayPal email, e.g. priya@${domains[0] ?? "personal.example.com"}`;
+  const who = risk?.email_check;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center" role="dialog" aria-modal="true" aria-label="Pay">
@@ -181,15 +134,14 @@ export default function SendSheet({ open, prefill, onClose }: { open: boolean; p
         ) : (
           <form ref={formRef} onSubmit={submit} noValidate className="space-y-4">
             <div className="flex items-center gap-3">
-              <Avatar name={name || receiver || "?"} seed={phone?.e164 || receiver || name} size={44} />
+              <Avatar name={name || receiver || "?"} seed={receiver || name} size={44} />
               <div className="flex-1 min-w-0 space-y-2">
                 <div className={`flex items-center bg-slate-50 border border-slate-200 rounded-2xl px-3 focus-within:border-[#1a73e8]${invalid(err.to)}`}>
-                  {byEmail ? <AtSign className="w-4 h-4 text-slate-500" /> : <Phone className="w-4 h-4 text-slate-500" />}
+                  <AtSign className="w-4 h-4 text-slate-500" />
                   <input className="flex-1 bg-transparent border-0 px-2 py-3 text-sm text-black outline-none"
                     type="text" inputMode="email" autoComplete="off" autoCapitalize="off" spellCheck={false}
                     placeholder={placeholder}
-                    data-field="to" value={to} onChange={(e) => { setTo(e.target.value); setErr({ ...err, to: "" }); }} aria-label="Recipient phone number or PayPal email" autoFocus />
-                  {verifying && <RefreshCw className="w-4 h-4 animate-spin text-[#1a73e8]" aria-label="Verifying number" />}
+                    data-field="to" value={to} onChange={(e) => { setTo(e.target.value); setErr({ ...err, to: "" }); }} aria-label="Recipient PayPal email" autoFocus />
                 </div>
                 <input className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-4 py-2.5 text-sm text-black outline-none focus:border-[#1a73e8]"
                   placeholder="Name (optional)" value={name} onChange={(e) => setName(e.target.value)} aria-label="Recipient name" />
@@ -198,12 +150,12 @@ export default function SendSheet({ open, prefill, onClose }: { open: boolean; p
             <FieldError msg={err.to} />
             {receiver && !err.to && (
               <div className="text-xs text-slate-500" aria-live="polite">
-                {byEmail ? (EMAIL.test(receiver) ? "Paying a PayPal account by email" : "Keep typing the PayPal email…")
-                  : looksLikePhone(receiver) ? "Paying the PayPal account linked to this number" : "Keep typing the number with its country code…"}
+                {!EMAIL.test(receiver) ? `Keep typing the PayPal email (${emailRule(domains)})…`
+                  : !receiverOk ? `Only PayPal sandbox emails (${emailRule(domains)}) can be paid.`
+                  : who ? <span className="flex items-start gap-1.5">{who.status === "on_payminute" ? <BadgeCheck className="w-4 h-4 text-emerald-700 shrink-0" /> : <CircleHelp className="w-4 h-4 shrink-0" />}<span><span className="text-black">{who.label}.</span> {who.detail}</span></span>
+                  : "Paying a PayPal sandbox account by email"}
               </div>
             )}
-
-            {!byEmail && phone && <PhoneCard check={phone} />}
 
             <div className="text-center py-2">
               <div className="inline-flex items-baseline gap-1 text-black">
@@ -238,10 +190,10 @@ export default function SendSheet({ open, prefill, onClose }: { open: boolean; p
             <FormAlert msg={failure} onClose={() => setFailure(null)} />
             <button type="submit" disabled={sending}
               className="gbtn w-full py-3.5 bg-[#1a73e8] text-white rounded-full text-sm disabled:opacity-50">
-              {sending ? "Paying…" : verifying || checking ? "Checking…" : valid ? `Pay ${money(amt)}` : !byEmail && phone && !phone.valid ? "Enter a valid number" : !byEmail && phone && !phone.payable ? "Not linked to PayPal yet" : "Pay"}
+              {sending ? "Paying…" : checking ? "Checking…" : valid ? `Pay ${money(amt)}` : "Pay"}
             </button>
             <div className="text-[11px] text-slate-500 text-center">
-              Sent with PayPal Payouts in the PayPal sandbox{byEmail ? "" : " to the PayPal account linked to this number"}. AI Guard checks the number and the payment before any money moves.
+              Sent with PayPal Payouts to a PayPal sandbox email. AI Guard checks the payment before any money moves.
             </div>
           </form>
         )}

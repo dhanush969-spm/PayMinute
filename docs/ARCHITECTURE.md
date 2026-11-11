@@ -35,18 +35,16 @@ flowchart LR
 ```
 
 ## Log in with PayPal
-1. `GET /api/auth/login` stores a random `state` in the signed session cookie and redirects to `https://www.sandbox.paypal.com/connect` with `scope=openid profile email phone https://uri.paypal.com/services/paypalattributes` and `redirect_uri = APP_BASE_URL/api/auth/callback`.
-2. `GET /api/auth/callback?code&state` checks `state`, exchanges the code (`POST /v1/oauth2/token`, `grant_type=authorization_code`), then reads `GET /v1/identity/oauth2/userinfo?schema=paypalv1.1`: name, emails, `payer_id`, `verified_account`, `phone_number`.
-3. The session (HTTP-only, signed, 8 h) keeps name, email, payer ID and phone. No PayPal token is stored. Every `/api/*` route except health, config and PayPal webhooks requires it (`AUTH_REQUIRED=true`). `ALLOWED_PAYPAL_EMAILS` can restrict who may sign in.
-4. If PayPal returned a phone number, it goes into the **PayPal phone directory** (`paypal_directory`: E.164 → payer ID, source `paypal`). If not, the user can add their own (`POST /api/auth/phone`, source `user`), but never a number PayPal assigned to someone else.
+1. `GET /api/auth/login` stores a random `state` in the signed session cookie and redirects to `https://www.sandbox.paypal.com/connect` with `scope=openid profile email https://uri.paypal.com/services/paypalattributes` and `redirect_uri = APP_BASE_URL/api/auth/callback`.
+2. `GET /api/auth/callback?code&state` checks `state`, exchanges the code (`POST /v1/oauth2/token`, `grant_type=authorization_code`), then reads `GET /v1/identity/oauth2/userinfo?schema=paypalv1.1`: name, emails, `payer_id`, `verified_account`.
+3. The session (HTTP-only, signed, 8 h) keeps name, email and payer ID. No PayPal token is stored. Every `/api/*` route except health, config and PayPal webhooks requires it (`AUTH_REQUIRED=true`). `ALLOWED_PAYPAL_EMAILS` can restrict who may sign in.
+4. The PayPal email goes into `paypal_emails` (email → payer ID, source `paypal`). If PayPal didn't share one, the user adds their own sandbox email (source `user`); someone else's email can't be claimed.
 
 ## Payment flows
 
-### Pay by phone (AI Guard + Payouts)
-The PayPal sandbox doesn't support Payouts `recipient_type: PHONE`, and no PayPal API reveals who owns a number. PayMinute therefore resolves a number to a PayPal account through the directory above:
-1. `POST /api/phone/verify` (AI Guard) runs `ai/phone.py`: libphonenumber validity, country, line type (mobile, landline, VoIP, premium-rate…), carrier; PayPal evidence (`verified` = from PayPal's profile, `linked` = added by the owner, `unknown` / `not_on_paypal`); a noisy-OR score, a verdict and a one-sentence LLM summary. `payable` is true only for valid, linked numbers.
-2. `POST /api/payouts/assess` merges the phone signals into the payment's fraud score. A high-risk phone check forces the whole payment to high.
-3. `POST /api/payouts` refuses unlinked numbers (`422`), then sends the payout with `recipient_type: PAYPAL_ID` and `receiver = payer_id`. The ledger stores the number in `counterparty_phone`.
+### Pay by PayPal email (AI Guard + Payouts)
+1. `POST /api/payouts/assess` checks the receiver is a PayPal sandbox email (`…@personal.example.com`), says whose email it is if they use PayMinute, and scores the payment.
+2. `POST /api/payouts` refuses phone numbers and other domains (`400`), then sends the payout with `recipient_type: EMAIL`.
 
 ### Send money (Payouts)
 1. As the user types, `POST /api/payouts/assess` runs the risk engine. No money moves.

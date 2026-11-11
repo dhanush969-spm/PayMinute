@@ -10,7 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from . import auth, config, db, ledger
-from .ai import agent, categorize, insights, llm as llm_mod, phone as phone_ai, status as status_ai
+from .ai import agent, categorize, insights, llm as llm_mod, status as status_ai
 from .integrations import kernel_preview, mcp_bridge
 from .paypal import service as pp
 
@@ -34,11 +34,6 @@ class CheckoutIn(BaseModel):
     amount: float = Field(gt=0, le=10000)
     description: str = Field(min_length=1, max_length=127)
     client_ref: str = Field(min_length=8, max_length=64)
-
-
-class PhoneIn(BaseModel):
-    phone: str = Field(min_length=4, max_length=32)
-    amount: float | None = Field(default=None, gt=0, le=20000)
 
 
 class ReviewIn(BaseModel):
@@ -110,7 +105,7 @@ def get_config(request: Request) -> dict[str, Any]:
                     "ended": None if user else getattr(request.state, "session_ended", None)},
         "currency": s.currency,
         "locale": s.locale,
-        "phone_region": s.phone_region,
+        "email_domains": s.paypal_email_domains,
         "business_name": s.business_name,
         "paypal_client_id": s.paypal_client_id if s.paypal_configured else None,
         "paypal_sdk_url": "https://www.sandbox.paypal.com/web-sdk/v6/core",
@@ -141,12 +136,6 @@ def home() -> dict[str, Any]:
         "recommendations": insights.rule_recommendations(hist)[:3],
         "risk_blocked_count": sum(1 for t in hist if t.get("risk_level") == "high"),
     }
-
-
-@router.post("/phone/verify")
-def verify_phone(body: PhoneIn) -> dict[str, Any]:
-    """Check a phone number before paying it."""
-    return phone_ai.analyze(body.phone, db.list_tx(limit=2000), body.amount, explain=True)
 
 
 @router.post("/payouts/assess")
@@ -243,7 +232,6 @@ def check_tx(tx_id: str) -> dict[str, Any]:
 LOGIN_SCOPES = {
     "profile": "your full name",
     "email": "your PayPal email",
-    "phone": "your phone number",
     "address": "your city and country",
     "https://uri.paypal.com/services/paypalattributes": "account verification and PayPal account ID",
 }
@@ -262,7 +250,7 @@ def paypal_account(request: Request) -> dict[str, Any]:
     from .paypal.client import PayPalError
     user = auth.current_user(request) or {}
     granted = config.settings.login_scopes.split()
-    profile = {k: user.get(k) for k in ("name", "email", "phone", "phone_source", "verified", "payer_id", "account", "address")}
+    profile = {k: user.get(k) for k in ("name", "email", "verified", "payer_id", "account", "address")}
     business: dict[str, Any] | None = None
     error = None
     try:
@@ -444,6 +432,7 @@ class ShopIn(BaseModel):
 class ParseIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=400)
     role: Literal["buy", "sell"] = "buy"
+    ai: bool = False  # also ask Gemini (sent once the user stops typing)
 
 
 class QuotePayIn(BaseModel):
@@ -475,10 +464,10 @@ def market_overview(request: Request, q: str | None = None, budget: float | None
 def market_list(body: ListingIn, request: Request) -> dict[str, Any]:
     from . import market
     user, account = _signed_in(request)
-    # buyers always pay the seller's own login phone or PayPal email; it can't be set from the request
-    payee = user.get("phone") or user.get("email")
-    if not payee:
-        raise HTTPException(400, "Add your phone in the account menu so buyers can pay you.")
+    # buyers always pay the seller's own PayPal email; it can't be set from the request
+    payee = (user.get("email") or "").lower()
+    if not config.settings.email_allowed(payee):
+        raise HTTPException(400, f"Add your PayPal sandbox email ({config.settings.email_rule}) so buyers can pay you.")
     return market.create_listing(body.title, body.price, payee, user.get("name"), account, body.description, body.floor)
 
 
@@ -501,8 +490,18 @@ def market_parse(body: ParseIn) -> dict[str, Any]:
     from . import market
     req = market.parse_request(body.prompt)
     hint = market.suggest_price(req["title"] or body.prompt, req["details"]) if req["title"] else None
-    return {"request": {k: req[k] for k in ("title", "details", "price", "floor", "wanted")},
-            "flaws": req["features"]["flaws"], "condition": req["features"]["condition"], "suggestion": hint}
+    out = {"request": {k: req[k] for k in ("title", "details", "price", "floor", "wanted")},
+           "flaws": req["features"]["flaws"], "condition": req["features"]["condition"], "suggestion": hint}
+    if body.ai:  # the page asks for Gemini's reading once the user stops typing
+        from .ai import negotiator
+        g = negotiator.read_listing(body.prompt, body.role, hint)
+        if g:
+            out["gemini"] = g
+            if g.get("price"):  # Gemini's price, from real market prices on the web plus this item's features and damage
+                out["suggestion"] = {"price": g["price"], "low": g["low"], "high": g["high"], "by": "gemini",
+                                     "basis": "Gemini, from current market prices: " + (g.get("thinking") or "judged from the features and condition").rstrip(". "),
+                                     "comparables": (hint or {}).get("comparables", 0), "sources": g.get("sources", [])}
+    return out
 
 
 @router.post("/market/shop/stream")
@@ -633,18 +632,27 @@ def ai_status() -> dict[str, Any]:
     import time
     llm = llm_mod.get_llm()
     if llm is None:
-        return {"ok": True, "provider": "planner", "model": None,
+        return {"ok": True, "provider": "planner", "model": None, "events": llm_mod.events(10),
                 "detail": "AI Guard runs on the built-in planner with PayPal Agent Toolkit and MCP server tools."}
     if _ai_status.get("at", 0) > time.time() - 300 and _ai_status.get("model") == llm.model:
-        return _ai_status["result"]
+        return {**_ai_status["result"], "events": llm_mod.events(10)}
     try:
-        reply = llm.chat([{"role": "user", "content": "Reply with the single word: ok"}], max_tokens=10, temperature=0)
+        with llm_mod.feature("status check"):
+            reply = llm.chat([{"role": "user", "content": "Reply with the single word: ok"}], max_tokens=200, temperature=0)
         result = {"ok": bool((reply.get("content") or "").strip()), "provider": llm.provider, "model": llm.model,
                   "detail": "AI is answering."}
+    except llm_mod.RateLimited as exc:
+        result = {"ok": False, "rate_limited": True, "provider": llm.provider, "model": llm.model, "detail": str(exc)[:300]}
     except llm_mod.LLMError as exc:
         result = {"ok": False, "provider": llm.provider, "model": llm.model, "detail": str(exc)[:300]}
     _ai_status.update(at=time.time(), model=llm.model, result=result)
-    return result
+    return {**result, "events": llm_mod.events(10)}
+
+
+@router.get("/ai/events")
+def ai_events() -> dict[str, Any]:
+    """Recent AI model problems (rate limits, errors), newest first. Also written to the backend log."""
+    return {"events": llm_mod.events(50)}
 
 
 @router.post("/webhooks/paypal")

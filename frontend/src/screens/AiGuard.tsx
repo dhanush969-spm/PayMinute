@@ -4,16 +4,22 @@ import { useNavigate } from "react-router-dom";
 import { AgentAction, AgentStep, api, newRef } from "../api";
 import { Markdown, RiskPanel, useApp } from "../components/ui";
 
-interface Msg { role: "user" | "bot"; text: string; steps?: AgentStep[]; actions?: AgentAction[] }
-const welcome = (name?: string): Msg => ({ role: "bot", text: `Hi${name ? ` ${name.split(" ")[0]}` : ""}! I'm PayMinute AI Guard. I verify phone numbers, check payments for fraud, explain stuck payments, and act for you through PayPal: pay contractors when jobs are done, run scheduled payments, and negotiate prices with sellers' agents. Anything that moves money waits for your approval.` });
-const SUGGESTIONS = [
-  "Verify +1 408 555 0134",
-  "Create a job logo design for +1 408 555 0134 for $80",
-  "Pay +1 408 555 0134 $20 every Friday",
-  "Negotiate a logo from +1 408 555 0134, budget $150",
-  "Buy a camera under $280",
-  "Split $90 dinner with Priya and Sam",
-  "Hmm, my money hasn't shown up yet",
+interface Msg { role: "user" | "bot"; text: string; steps?: AgentStep[]; actions?: AgentAction[]; by?: string }
+interface AiEvent { at: string; kind: "rate_limit" | "error"; feature: string; provider?: string; model?: string; detail: string }
+const welcome = (name?: string): Msg => ({ role: "bot", text: `Hi${name ? ` ${name.split(" ")[0]}` : ""}! I'm PayMinute AI Guard. I check payments to PayPal emails for fraud, explain stuck payments, and act for you through PayPal: pay contractors when jobs are done, run scheduled payments, and negotiate prices with sellers' agents. Anything that moves money waits for your approval.` });
+// "Try asking": plain prompts with no sample data. Ones that need details (who, how much) are put in the box
+// for you to finish; the rest are sent straight away.
+const SUGGESTIONS: { label: string; start?: string }[] = [
+  { label: "Verify a payment", start: "Is it safe to pay " },
+  { label: "Pay someone", start: "Send " },
+  { label: "Create a job", start: "Create a job " },
+  { label: "Schedule a payment", start: "Schedule a payment to " },
+  { label: "Negotiate a price", start: "Negotiate " },
+  { label: "Buy something", start: "Buy " },
+  { label: "Split a bill", start: "Split " },
+  { label: "Which payments are stuck?" },
+  { label: "Where did my money go this month?" },
+  { label: "What did my agents do?" },
 ];
 
 function sid(): string {
@@ -50,10 +56,20 @@ export default function GAiGuard() {
     setListening(true);
     r.start();
   }
-  const [aiStatus, setAiStatus] = useState<{ ok: boolean; provider: string; model?: string; detail: string } | null>(null);
+  const [aiStatus, setAiStatus] = useState<{ ok: boolean; provider: string; model?: string; detail: string; rate_limited?: boolean; events?: AiEvent[] } | null>(null);
   useEffect(() => { api.get<typeof aiStatus>("/ai/status").then(setAiStatus).catch(() => setAiStatus({ ok: false, provider: "?", detail: "AI status check failed" })); }, []);
+  // the latest rate limit in the last 15 minutes, from any agent (bargaining, chat, pricing)
+  const limit = aiStatus?.events?.find((e) => e.kind === "rate_limit" && Date.now() - Date.parse(e.at) < 15 * 60 * 1000);
   const scroller = useRef<HTMLDivElement>(null);
   useEffect(() => { scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" }); }, [msgs, busy]);
+
+  const box = useRef<HTMLInputElement>(null);
+  // a prompt that needs details goes in the box for you to finish; a complete one is sent
+  function pick(s: { label: string; start?: string }) {
+    if (!s.start) { ask(s.label); return; }
+    setInput(s.start);
+    setTimeout(() => { const el = box.current; if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, 0);
+  }
 
   async function ask(text: string) {
     if (!text.trim() || busy) return;
@@ -61,8 +77,9 @@ export default function GAiGuard() {
     setInput("");
     setBusy(true);
     try {
-      const r = await api.post<{ reply: string; steps: AgentStep[]; pending_actions: AgentAction[]; navigate?: string | null }>("/agent/chat", { session_id: session.current, message: text });
-      setMsgs((m) => [...m, { role: "bot", text: r.reply, steps: r.steps, actions: r.pending_actions }]);
+      const r = await api.post<{ reply: string; steps: AgentStep[]; pending_actions: AgentAction[]; navigate?: string | null; mode?: string; model?: string; notice?: { kind: string; text: string } }>("/agent/chat", { session_id: session.current, message: text });
+      setMsgs((m) => [...m, { role: "bot", text: r.reply, steps: r.steps, actions: r.pending_actions, by: r.mode === "llm" ? r.model : undefined }]);
+      if (r.notice) { toast(r.notice.text, "error"); api.get<typeof aiStatus>("/ai/status").then(setAiStatus).catch(() => undefined); }
       // the shopping agent made a deal: open the locked checkout (only our own app routes)
       if (r.navigate && /^\/checkout\/quo_[A-Za-z0-9_-]+$/.test(r.navigate)) setTimeout(() => navigate(r.navigate!), 2500);
       if (speak && "speechSynthesis" in window) {
@@ -94,8 +111,9 @@ export default function GAiGuard() {
             <div className="text-sm text-black">PayMinute AI Guard</div>
             <div className={`text-[11px] flex items-center gap-1 ${aiStatus && !aiStatus.ok ? "text-amber-700" : "text-emerald-700"}`} title={aiStatus?.detail}>
               <span className={`w-1.5 h-1.5 rounded-full ${aiStatus && !aiStatus.ok ? "bg-amber-600" : "bg-emerald-600 animate-pulse"}`} />
-              {aiStatus == null ? "Checking…" : aiStatus.provider === "planner" ? "PayPal Agent Toolkit · PayPal MCP server" : aiStatus.ok ? `${aiStatus.model ?? aiStatus.provider} · PayPal Agent Toolkit` : "AI model offline · built-in planner"}
+              {aiStatus == null ? "Checking…" : aiStatus.provider === "planner" ? "PayPal Agent Toolkit · PayPal MCP server" : aiStatus.ok ? `${aiStatus.provider === "gemini" ? "Google Gemini" : aiStatus.provider} ${aiStatus.model ?? ""} · PayPal Agent Toolkit` : aiStatus.rate_limited ? `${aiStatus.model} rate limit hit · built-in planner for now` : "AI model offline · built-in planner"}
             </div>
+            {limit && <div className="text-[11px] text-amber-800 mt-0.5" title={limit.detail}>Rate limit hit at {new Date(limit.at).toLocaleTimeString()} ({limit.feature}). PayMinute used its built-in rules for that step.</div>}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -111,6 +129,7 @@ export default function GAiGuard() {
           <div key={i} className={`flex flex-col ${m.role === "user" ? "items-end" : "items-start"} gap-1.5`}>
             <div className={`max-w-[85%] px-4 py-3 rounded-2xl text-sm leading-relaxed ${m.role === "user" ? "bg-[#1a73e8] text-white rounded-tr-md" : "bg-white border border-slate-200 text-black rounded-tl-md"}`}>
               {m.role === "bot" ? <div className="gp-md"><Markdown text={m.text} /></div> : m.text}
+              {m.role === "bot" && m.by && <div className="text-[10px] text-slate-400 mt-1">Answered by {m.by}</div>}
             </div>
             {m.steps && m.steps.length > 0 && (
               <div className="flex flex-wrap gap-1.5 max-w-[85%]">
@@ -150,11 +169,11 @@ export default function GAiGuard() {
 
       {msgs.length <= 1 && (
         <div className="flex flex-wrap gap-2 lg:hidden">
-          {SUGGESTIONS.map((s) => <button key={s} className="gbtn text-xs px-3 py-1.5 rounded-full bg-white border border-slate-200 text-black hover:border-[#1a73e8]" onClick={() => ask(s)}>{s}</button>)}
+          {SUGGESTIONS.map((s) => <button key={s.label} className="gbtn text-xs px-3 py-1.5 rounded-full bg-white border border-slate-200 text-black hover:border-[#1a73e8]" onClick={() => pick(s)}>{s.label}</button>)}
         </div>
       )}
       <form className="flex gap-2 bg-white p-2 rounded-full border border-slate-200" onSubmit={(e) => { e.preventDefault(); ask(input); }}>
-        <input className="flex-1 bg-transparent border-0 px-3 py-2 text-sm text-black outline-none" placeholder="Ask about payments, risk or spending…" value={input} onChange={(e) => setInput(e.target.value)} aria-label="Message" />
+        <input ref={box} className="flex-1 bg-transparent border-0 px-3 py-2 text-sm text-black outline-none" placeholder="Ask about payments, risk or spending…" value={input} onChange={(e) => setInput(e.target.value)} aria-label="Message" />
         <button type="button" className={`gbtn w-10 h-10 rounded-full flex items-center justify-center ${listening ? "bg-red-600 text-white animate-pulse" : "bg-slate-100 text-black"}`}
           onClick={listen} disabled={busy} aria-label={listening ? "Stop listening" : "Speak your request"} title="Speak your request">
           {listening ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
@@ -168,12 +187,12 @@ export default function GAiGuard() {
       <section className="bg-white rounded-2xl border border-slate-200 p-4 space-y-2">
         <div className="text-sm text-black">Try asking</div>
         {SUGGESTIONS.map((s) => (
-          <button key={s} className="gbtn w-full text-left text-sm px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-black hover:border-[#1a73e8] disabled:opacity-50" disabled={busy} onClick={() => ask(s)}>{s}</button>
+          <button key={s.label} className="gbtn w-full text-left text-sm px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-black hover:border-[#1a73e8] disabled:opacity-50" disabled={busy} onClick={() => pick(s)}>{s.label}</button>
         ))}
       </section>
       <section className="bg-white rounded-2xl border border-slate-200 p-4 space-y-2 text-xs text-slate-600">
         <div className="text-sm text-black flex items-center gap-1.5"><ShieldCheck className="w-4 h-4 text-emerald-600" /> How AI Guard keeps you safe</div>
-        <div>Phone numbers are verified with PayPal before you pay.</div>
+        <div>Payments only go to PayPal sandbox emails (…@personal.example.com), never phone numbers.</div>
         <div>Every payment is scored for scams, duplicates and unusual amounts.</div>
         <div>Anything that moves money waits for you to approve it.</div>
       </section>

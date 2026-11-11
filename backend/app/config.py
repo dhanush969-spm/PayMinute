@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +40,11 @@ class Settings:
     )
     paypal_webhook_id: str = field(default_factory=lambda: os.getenv("PAYPAL_WEBHOOK_ID", "").strip())
 
+    # Google Gemini runs the Buy/Sell agents' bargaining (rule-based agents are used when no key is set)
+    gemini_api_key: str = field(default_factory=lambda: (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip())
+    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-flash-latest").strip())
+    # how much Gemini thinks before each answer: none | low | medium | high
+    gemini_thinking: str = field(default_factory=lambda: os.getenv("GEMINI_THINKING", "low").strip().lower())
     llm_provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "").strip().lower())
     llm_api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", "").strip())
     llm_model_raw: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "").strip())
@@ -55,6 +61,9 @@ class Settings:
     business_name: str = field(default_factory=lambda: os.getenv("PAYMINUTE_BUSINESS_NAME", "PayMinute"))
     # country for numbers typed without +code
     phone_region: str = field(default_factory=lambda: os.getenv("PAYMINUTE_PHONE_REGION", "US").strip().upper() or "US")
+    # PayMinute pays PayPal emails only, and only PayPal sandbox personal accounts (…@personal.example.com)
+    paypal_email_domains: list[str] = field(default_factory=lambda: [
+        d.strip().lower().lstrip("@") for d in os.getenv("PAYPAL_EMAIL_DOMAINS", "personal.example.com").split(",") if d.strip()])
     # require Log in with PayPal for the API
     auth_required: bool = field(default_factory=lambda: _bool("AUTH_REQUIRED", True))
     # signs the login cookie; random if unset
@@ -64,7 +73,7 @@ class Settings:
     session_hours: int = field(default_factory=lambda: int(os.getenv("SESSION_HOURS", "8")))
     # optional allow-list of PayPal emails
     # must match the attributes enabled under "Log in with PayPal" in the PayPal app
-    login_scopes: str = field(default_factory=lambda: (os.getenv("PAYPAL_LOGIN_SCOPES") or "openid profile email phone https://uri.paypal.com/services/paypalattributes").strip())
+    login_scopes: str = field(default_factory=lambda: (os.getenv("PAYPAL_LOGIN_SCOPES") or "openid profile email https://uri.paypal.com/services/paypalattributes").strip())
     allowed_emails: list[str] = field(default_factory=lambda: [e.strip().lower() for e in os.getenv("ALLOWED_PAYPAL_EMAILS", "").split(",") if e.strip()])
     status_poll_seconds: int = field(default_factory=lambda: int(os.getenv("STATUS_POLL_SECONDS", "60")))
     # incoming payments at or above this score are held
@@ -80,6 +89,8 @@ class Settings:
 
     @property
     def resolved_llm_provider(self) -> str:
+        if self.gemini_api_key and self.llm_provider in {"", "none", "offline", "gemini"}:
+            return "gemini"  # a Gemini key turns Gemini on for every AI agent
         if self.llm_provider in {"none", "offline"}:
             return "offline"
         if self.llm_provider and self.llm_provider in LLM_DEFAULTS:
@@ -96,6 +107,15 @@ class Settings:
         if raw is None:
             raw = LLM_DEFAULTS.get(self.resolved_llm_provider, {}).get("fallbacks", "")
         return [m.strip() for m in raw.split(",") if m.strip() and m.strip() != self.llm_model]
+
+    def email_allowed(self, email: str | None) -> bool:
+        e = (email or "").strip().lower()
+        return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", e)) and (
+            not self.paypal_email_domains or e.rsplit("@", 1)[1] in self.paypal_email_domains)
+
+    @property
+    def email_rule(self) -> str:
+        return " or ".join(f"…@{d}" for d in self.paypal_email_domains) or "a PayPal email"
 
     @property
     def llm_model(self) -> str:

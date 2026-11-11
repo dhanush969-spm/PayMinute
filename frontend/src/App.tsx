@@ -13,7 +13,7 @@ import GHome from "./screens/Home";
 import GHistory from "./screens/History";
 import GInsights from "./screens/InsightsLite";
 import GAiGuard from "./screens/AiGuard";
-import { LoginScreen, MyPhone, SetupScreen } from "./screens/Login";
+import { LoginScreen, MyPayPalEmail, SetupScreen } from "./screens/Login";
 import GetPaid from "./pages/GetPaid";
 import Insights from "./pages/Insights";
 import Agents from "./pages/Agents";
@@ -132,7 +132,7 @@ export default function App() {
       <div className="text-sm text-black truncate">{userName}</div>
       {user?.email && <div className="text-xs text-slate-500 truncate">{user.email}</div>}
       <div className="text-[11px] text-slate-500">Signed in with PayPal (sandbox){user?.payer_id ? ` · ${user.payer_id}` : ""}</div>
-      {user && <MyPhone user={user} onSaved={reloadConfig} toast={toast} />}
+      {user && <MyPayPalEmail user={user} onSaved={reloadConfig} toast={toast} />}
       <Link to="/account" className="flex items-center gap-2 px-3 py-2 rounded-xl hover:bg-slate-50 text-sm text-black no-underline"><Wallet className="w-4 h-4" /> PayPal account &amp; balance</Link>
       {config.auth_required && (
         <>

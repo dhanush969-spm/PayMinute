@@ -1,7 +1,7 @@
 """Agent marketplace: sellers list items; a buyer agent compares them, bargains and prepares a locked checkout.
 
 Security model:
-- A listing always pays the seller's own PayPal-linked phone or PayPal email (taken from their login).
+- A listing always pays the seller's own PayPal email (taken from their login, …@personal.example.com).
 - The seller's lowest price is private; only the seller sees it.
 - A deal becomes a one-time quote stored on the server (buyer, listing, payee, price, 10-minute expiry).
   Checkout pays the quote by id, so the browser can never change who is paid or how much.
@@ -15,7 +15,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import automation, db, ledger
-from .ai import phone as phone_ai
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS listings (
@@ -191,9 +190,7 @@ def create_listing(title: str, price: float, payee: str, seller_name: str | None
         raise ledger.FlowError("Price must be greater than zero.")
     if floor is not None and not 0 < floor <= price:
         raise ledger.FlowError("Your lowest price must be more than 0 and no higher than the price.")
-    who = ledger.resolve_receiver(payee)
-    if who["type"] == "PHONE_UNLINKED":
-        raise ledger.FlowError("Your phone isn't linked to a PayPal account yet, so buyers couldn't pay you.")
+    ledger.resolve_receiver(payee)  # a PayPal sandbox email, or this raises
     floor = round(floor if floor is not None and 0 < floor <= price else price * 0.9, 2)
     item = {"id": db.new_id("lst_"), "seller_account": seller_account, "seller_name": seller_name, "payee": payee.strip(),
             "title": title.strip()[:80], "description": (description or "").strip()[:400] or None, "price": round(price, 2),
@@ -240,13 +237,16 @@ def remove_listing(listing_id: str, account: str | None) -> None:
 
 def _trust(payee: str) -> dict[str, Any]:
     """How much PayPal vouches for the seller's account."""
-    who = ledger.resolve_receiver(payee)
-    if who["phone"]:
-        check = phone_ai.analyze(who["phone"], ledger.history())
-        status = check["paypal"]["status"]
-        score = {"verified": 1.0, "linked": 0.7}.get(status, 0.2) * (1 - check.get("score", 0))
-        return {"score": round(score, 2), "label": check["paypal"]["label"], "level": check["level"]}
-    return {"score": 0.6, "label": "PayPal email", "level": "low"}
+    try:
+        who = ledger.resolve_receiver(payee)
+    except ledger.FlowError:  # e.g. an old listing that still pays a phone number
+        return {"score": 0.0, "label": "Can't be paid", "level": "high"}
+    known = db.find_email(who["email"])
+    if known and known["source"] == "paypal":
+        return {"score": 1.0, "label": "Verified by PayPal", "level": "low"}
+    if known:
+        return {"score": 0.7, "label": "PayPal email on PayMinute", "level": "low"}
+    return {"score": 0.5, "label": "PayPal sandbox email", "level": "low"}
 
 
 def _spec(key: str, value: float) -> str:
@@ -541,10 +541,25 @@ def shop_events(prompt: str, budget: float | None, account: str | None, pause: f
             continue
         fair = (suggest_price(item["title"], item["description"], exclude_id=item["id"]) or {}).get("price") \
             or (fair_req or {}).get("price")
+        from .ai import negotiator  # Google Gemini picks each move when GEMINI_API_KEY is set; rules otherwise
+        by = " · agents powered by Google Gemini" if negotiator.available() else ""
+        checked = negotiator.review_price(item, suggest_price(item["title"], item["description"], exclude_id=item["id"]))
+        if checked and checked.get("price"):
+            fair = checked["price"]
+            seen = ", ".join(f"{m['source']} ${m['price']:,.0f}" for m in checked.get("market", [])[:3])
+            yield {"type": "stage", "by": "gemini", "thinking": checked.get("thinking"), "sources": checked.get("sources", []),
+                   "market": checked.get("market", []),
+                   "text": f"Gemini checked market prices on the web" + (f" ({seen})" if seen else "")
+                           + f": fair price about ${fair:.2f}" + (f". {checked['thinking']}" if checked.get("thinking") else "")}
+        elif checked and checked.get("note"):
+            yield {"type": "stage", "note": checked["note"], "text": checked["note"]}
         yield {"type": "pick", "listing": pick, "fair": fair, "reason": _reason(pick, candidates),
-               "text": f"Bargaining with the seller of “{item['title']}”" + (f" (AI fair price ${fair:.2f})" if fair else "")}
-        buyer = automation.BuyerAgent(budget, fair, _leverage(pick, candidates, fair, budget))
-        seller = automation.SellerAgent(item["price"], item["floor"], _strengths(item))
+               "text": f"Bargaining with the seller of “{item['title']}”" + (f" (AI fair price ${fair:.2f})" if fair else "") + by}
+        listing = {"title": item["title"], "description": item["description"], "list_price": item["price"]}
+        buyer = negotiator.make_buyer(budget, fair, _leverage(pick, candidates, fair, budget),
+                                      {**listing, "buyer_wanted": req.get("wanted") or [], "has": pick.get("has") or [],
+                                       "missing": pick.get("lacks") or []})
+        seller = negotiator.make_seller(item["price"], item["floor"], _strengths(item), listing)
         price = None
         for step in automation.bargain_steps(buyer, seller, item["title"]):
             if isinstance(step, tuple):
@@ -622,7 +637,7 @@ def get_quote(quote_id: str, account: str | None) -> dict[str, Any]:
     view = quote_view(q)
     check = ledger.assess_payout(q["payee"], q["price"], f"Bought: {q['title']}", q["seller_name"])
     view["risk"] = {k: check.get(k) for k in ("score", "level", "reasons", "recommendation")}
-    view["recipient"] = {"type": check["recipient"]["type"], "verified": (check.get("phone_check") or {}).get("paypal", {}).get("label")}
+    view["recipient"] = {"type": check["recipient"]["type"], "verified": _trust(q["payee"])["label"]}
     return view
 
 

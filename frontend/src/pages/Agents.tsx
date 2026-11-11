@@ -101,7 +101,7 @@ export default function Agents() {
         <div className="text-sm text-slate-700">
           <div className="text-black">Payment agents</div>
           Agents buy and pay through PayPal on your behalf: they shop and check out for you, pay a contractor when the job is done,
-          run scheduled payments and settle prices they negotiated with other agents. Every payment gets the same phone and risk checks as a manual one. Low-risk payments within your limits go out
+          run scheduled payments and settle prices they negotiated with other agents. Every payment goes to a PayPal sandbox email and gets the same risk checks as a manual one. Low-risk payments within your limits go out
           automatically; anything else waits for you.
           {data && <div className="text-xs text-slate-500 mt-1">Agents spent {money(data.spent_today)} today of your {money(data.settings.daily_limit)} daily limit.</div>}
         </div>
@@ -140,7 +140,7 @@ export default function Agents() {
           <form onSubmit={addJob} noValidate className="bg-white rounded-3xl border border-slate-200 p-4 space-y-2.5">
             <div className="text-sm text-black">New job: pay when it's done</div>
             <div><input data-field="jobTitle" className={field + invalid(err.jobTitle)} placeholder="What's the job? e.g. Logo design" value={job.title} onChange={(e) => { setJob({ ...job, title: e.target.value }); clear("jobTitle"); }} aria-label="Job title" /><FieldError msg={err.jobTitle} /></div>
-            <div><input data-field="jobPayee" className={field + invalid(err.jobPayee)} placeholder="Contractor's phone or PayPal email" value={job.payee} onChange={(e) => { setJob({ ...job, payee: e.target.value }); clear("jobPayee"); }} aria-label="Contractor" /><FieldError msg={err.jobPayee} /></div>
+            <div><input data-field="jobPayee" className={field + invalid(err.jobPayee)} placeholder="Contractor's PayPal email (…@personal.example.com)" value={job.payee} onChange={(e) => { setJob({ ...job, payee: e.target.value }); clear("jobPayee"); }} aria-label="Contractor" /><FieldError msg={err.jobPayee} /></div>
             <div className="flex gap-2 items-start">
               <div className="flex-1"><input data-field="jobAmount" className={field + invalid(err.jobAmount)} inputMode="decimal" placeholder="Amount" value={job.amount} onChange={(e) => { setJob({ ...job, amount: e.target.value.replace(/[^0-9.]/g, "") }); clear("jobAmount"); }} aria-label="Amount" /><FieldError msg={err.jobAmount} /></div>
               <button className={primary} disabled={busy}>Add job</button>
@@ -166,7 +166,7 @@ export default function Agents() {
         <div className="grid gap-4 xl:grid-cols-2 xl:items-start">
           <form onSubmit={addSch} noValidate className="bg-white rounded-3xl border border-slate-200 p-4 space-y-2.5">
             <div className="text-sm text-black">Schedule a payment</div>
-            <div><input data-field="schPayee" className={field + invalid(err.schPayee)} placeholder="Phone or PayPal email" value={sch.payee} onChange={(e) => { setSch({ ...sch, payee: e.target.value }); clear("schPayee"); }} aria-label="Payee" /><FieldError msg={err.schPayee} /></div>
+            <div><input data-field="schPayee" className={field + invalid(err.schPayee)} placeholder="PayPal email (…@personal.example.com)" value={sch.payee} onChange={(e) => { setSch({ ...sch, payee: e.target.value }); clear("schPayee"); }} aria-label="Payee" /><FieldError msg={err.schPayee} /></div>
             <div className="flex gap-2 items-start">
               <div className="flex-1"><input data-field="schAmount" className={field + invalid(err.schAmount)} inputMode="decimal" placeholder="Amount" value={sch.amount} onChange={(e) => { setSch({ ...sch, amount: e.target.value.replace(/[^0-9.]/g, "") }); clear("schAmount"); }} aria-label="Amount" /><FieldError msg={err.schAmount} /></div>
               <select className={field} value={sch.every} onChange={(e) => setSch({ ...sch, every: e.target.value })} aria-label="How often">
@@ -209,7 +209,7 @@ export default function Agents() {
             <div className="text-sm text-black">Let your agent negotiate and pay</div>
             <div className="text-xs text-slate-500">Your buyer agent trades offers with the seller's agent, never goes above your budget, and pays the agreed price through PayPal. The seller's agent is simulated inside PayMinute.</div>
             <div><input data-field="dealItem" className={field + invalid(err.dealItem)} placeholder="What are you buying? e.g. Logo design" value={deal.item} onChange={(e) => { setDeal({ ...deal, item: e.target.value }); clear("dealItem"); }} aria-label="Item" /><FieldError msg={err.dealItem} /></div>
-            <div><input data-field="dealSeller" className={field + invalid(err.dealSeller)} placeholder="Seller's phone or PayPal email" value={deal.seller} onChange={(e) => { setDeal({ ...deal, seller: e.target.value }); clear("dealSeller"); }} aria-label="Seller" /><FieldError msg={err.dealSeller} /></div>
+            <div><input data-field="dealSeller" className={field + invalid(err.dealSeller)} placeholder="Seller's PayPal email (…@personal.example.com)" value={deal.seller} onChange={(e) => { setDeal({ ...deal, seller: e.target.value }); clear("dealSeller"); }} aria-label="Seller" /><FieldError msg={err.dealSeller} /></div>
             <div className="flex gap-2 items-start">
               <div className="flex-1"><input data-field="dealBudget" className={field + invalid(err.dealBudget)} inputMode="decimal" placeholder="Your budget" value={deal.budget} onChange={(e) => { setDeal({ ...deal, budget: e.target.value.replace(/[^0-9.]/g, "") }); clear("dealBudget"); }} aria-label="Budget" /><FieldError msg={err.dealBudget} /></div>
               <button className={primary} disabled={busy}>Start</button>

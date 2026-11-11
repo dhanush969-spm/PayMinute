@@ -1,11 +1,17 @@
 """LLM client with tool calling (OpenAI-compatible APIs and Anthropic)."""
 from __future__ import annotations
 
+import collections
+import contextlib
+import contextvars
 import copy
 import json
 import logging
+import os
 import re
+import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -17,6 +23,51 @@ log = logging.getLogger("payminute.llm")
 
 class LLMError(Exception):
     pass
+
+
+class RateLimited(LLMError):
+    """The provider said 429 / RESOURCE_EXHAUSTED (e.g. Gemini's per-minute limit)."""
+
+
+# which feature is calling the model, for the error log ("bargaining", "AI Guard chat", ...)
+FEATURE: contextvars.ContextVar[str] = contextvars.ContextVar("ai_feature", default="AI")
+_events: collections.deque[dict[str, Any]] = collections.deque(maxlen=60)
+_events_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def feature(name: str):
+    token = FEATURE.set(name)
+    try:
+        yield
+    finally:
+        FEATURE.reset(token)
+
+
+def record(kind: str, detail: str, provider: str | None = None, model: str | None = None) -> dict[str, Any]:
+    """Log a model problem (rate limit, error) and keep it for /api/ai/status and the UI."""
+    ev = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "kind": kind, "feature": FEATURE.get(),
+          "provider": provider, "model": model, "detail": re.sub(r"\s+", " ", str(detail))[:300]}
+    with _events_lock:
+        _events.appendleft(ev)
+    (log.warning if kind == "rate_limit" else log.error)("AI %s in %s (%s %s): %s", kind, ev["feature"], provider,
+                                                          model, ev["detail"])
+    return ev
+
+
+def events(limit: int = 20) -> list[dict[str, Any]]:
+    with _events_lock:
+        return list(_events)[:limit]
+
+
+def _retry_after(resp: httpx.Response) -> float | None:
+    m = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', resp.text or "")
+    if m:
+        return float(m.group(1))
+    try:
+        return float(resp.headers.get("retry-after", ""))
+    except ValueError:
+        return None
 
 
 _KEEP = {"type", "description", "enum", "properties", "required", "items", "minimum", "maximum"}
@@ -121,7 +172,8 @@ class OpenAICompatLLM(BaseLLM):
         last: LLMError | None = None
         for model in [self.model, *self.fallbacks]:
             try:
-                return _post_with_retry(self._http, f"{self.base_url}/chat/completions", {**body, "model": model}, headers)
+                return _post_with_retry(self._http, f"{self.base_url}/chat/completions", {**body, "model": model}, headers,
+                                        provider=self.provider)
             except LLMError as exc:
                 last = exc
                 if not any(k in str(exc).lower() for k in BUSY):
@@ -148,7 +200,7 @@ class OpenAICompatLLM(BaseLLM):
             else:
                 payload_msgs.append({"role": m["role"], "content": m.get("content") or ""})
         body: dict[str, Any] = {"model": self.model, "messages": payload_msgs, "temperature": temperature,
-                                "max_tokens": max_tokens}
+                                "max_tokens": max_tokens, **getattr(self, "extra", {})}
         if tools:
             body["tools"] = [{"type": "function", "function": {
                 "name": t["name"], "description": t["description"][:1024],
@@ -162,13 +214,19 @@ class OpenAICompatLLM(BaseLLM):
             headers["Authorization"] = f"Bearer {self.api_key}"
         try:
             data = self._post(body, headers)
+        except RateLimited:
+            raise
         except LLMError as exc:
-            # newer OpenAI models reject max_tokens / temperature
-            if "max_tokens" not in str(exc) and "temperature" not in str(exc):
+            if "reasoning" in str(exc).lower() and "reasoning_effort" in body:
+                self.extra = {}  # this model has no thinking setting
+                body.pop("reasoning_effort", None)
+                data = self._post(body, headers)
+            elif "max_tokens" in str(exc) or "temperature" in str(exc):  # newer OpenAI models reject these
+                body.pop("temperature", None)
+                body["max_completion_tokens"] = body.pop("max_tokens", max_tokens)
+                data = self._post(body, headers)
+            else:
                 raise
-            body.pop("temperature", None)
-            body["max_completion_tokens"] = body.pop("max_tokens", max_tokens)
-            data = self._post(body, headers)
         choice = (data.get("choices") or [{}])[0].get("message") or {}
         calls = [{
             "id": tc.get("id") or f"call_{i}_{int(time.time())}",
@@ -221,26 +279,37 @@ class AnthropicLLM(BaseLLM):
             elif tool_choice == "none":
                 body["tool_choice"] = {"type": "none"}
         headers = {"x-api-key": self.api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-        data = _post_with_retry(self._http, f"{self.base_url}/v1/messages", body, headers)
+        data = _post_with_retry(self._http, f"{self.base_url}/v1/messages", body, headers, provider="anthropic")
         text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
         calls = [{"id": b["id"], "name": b["name"], "arguments": b.get("input") or {}}
                  for b in data.get("content", []) if b.get("type") == "tool_use"]
         return {"content": text, "tool_calls": calls}
 
 
-def _post_with_retry(http: httpx.Client, url: str, body: dict, headers: dict, retries: int = 2) -> dict[str, Any]:
+def _post_with_retry(http: httpx.Client, url: str, body: dict, headers: dict, retries: int = 2,
+                     provider: str | None = None, model: str | None = None) -> dict[str, Any]:
+    model = model or body.get("model")
     for attempt in range(retries + 1):
         try:
             resp = http.post(url, json=body, headers=headers)
         except httpx.TransportError as exc:
             if attempt == retries:
+                record("error", f"could not reach the provider: {exc}", provider, model)
                 raise LLMError(f"Could not reach the LLM provider: {exc}") from exc
             time.sleep(1.5 * (attempt + 1))
             continue
-        if resp.status_code in (429, 500, 502, 503, 529) and attempt < retries:
+        if resp.status_code == 429 or "RESOURCE_EXHAUSTED" in (resp.text or "")[:2000] and not resp.is_success:
+            wait = _retry_after(resp)
+            record("rate_limit", f"HTTP {resp.status_code}, retry after {wait or '?'}s: {resp.text[:200]}", provider, model)
+            if attempt < retries and (wait or 2) <= 12:  # a short wait is fine; a long one means try the backup model
+                time.sleep(max(1.0, wait or 2 * (attempt + 1)))
+                continue
+            raise RateLimited(f"Rate limit hit (HTTP 429) on {provider or 'the AI model'} {model}: {resp.text[:200]}")
+        if resp.status_code in (500, 502, 503, 529) and attempt < retries:
             time.sleep(2 * (attempt + 1))
             continue
         if not resp.is_success:
+            record("error", f"HTTP {resp.status_code}: {resp.text[:200]}", provider, model)
             raise LLMError(f"LLM provider error {resp.status_code}: {resp.text[:400]}")
         return resp.json()
     raise LLMError("LLM request failed")
@@ -259,7 +328,9 @@ def get_llm() -> BaseLLM | None:
     if key == _llm_key:
         return _llm
     _llm_key = key
-    if provider == "offline":
+    if provider == "gemini":  # one Gemini client for every AI feature
+        _llm = get_gemini()
+    elif provider == "offline":
         _llm = None
     elif provider == "anthropic":
         _llm = AnthropicLLM(s.llm_api_key, s.llm_model, s.llm_base_url or "https://api.anthropic.com")
@@ -268,7 +339,86 @@ def get_llm() -> BaseLLM | None:
     return _llm
 
 
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+_gemini: BaseLLM | None = None
+_gemini_key: tuple | None = None
+
+
+def get_gemini() -> BaseLLM | None:
+    """Google Gemini (OpenAI-compatible endpoint), used by every AI agent, or None when GEMINI_API_KEY isn't set."""
+    global _gemini, _gemini_key
+    s = config.settings
+    key = (bool(s.gemini_api_key), s.gemini_model, s.gemini_thinking)
+    if key == _gemini_key:
+        return _gemini
+    _gemini_key = key
+    _gemini = None
+    if s.gemini_api_key:
+        _gemini = OpenAICompatLLM("gemini", GEMINI_BASE_URL, s.gemini_api_key, s.gemini_model or "gemini-flash-latest",
+                                  [m for m in ("gemini-2.5-flash",) if m != s.gemini_model])
+        _gemini._http = httpx.Client(timeout=30)  # a live negotiation can't wait long
+        if s.gemini_thinking in {"none", "low", "medium", "high"}:
+            _gemini.extra = {"reasoning_effort": s.gemini_thinking}  # how much Gemini thinks before answering
+    return _gemini
+
+
+GEMINI_NATIVE_URL = os.getenv("GEMINI_NATIVE_URL", GEMINI_BASE_URL.removesuffix("/openai")).rstrip("/")
+_ground_http: httpx.Client | None = None
+
+
+def gemini_grounded(system: str, user: str, temperature: float = 0.2) -> dict[str, Any] | None:
+    """Gemini with Google Search grounding, so it can look up real, current market prices on the web.
+    Returns {"text", "thoughts", "sources": [{"title", "uri"}], "model"}, or None when no Gemini key is set."""
+    global _ground_http
+    s = config.settings
+    if not s.gemini_api_key:
+        return None
+    _ground_http = _ground_http or httpx.Client(timeout=45)
+    headers = {"Content-Type": "application/json", "x-goog-api-key": s.gemini_api_key}
+    body: dict[str, Any] = {
+        "systemInstruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": user}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"temperature": temperature, "thinkingConfig": {"includeThoughts": True}},
+    }
+    models = [s.gemini_model or "gemini-flash-latest"] + [m for m in ("gemini-2.5-flash",) if m != s.gemini_model]
+    last: LLMError | None = None
+    for model in models:
+        url = f"{GEMINI_NATIVE_URL}/models/{model}:generateContent"
+        try:
+            try:
+                data = _post_with_retry(_ground_http, url, {**body}, headers, provider="gemini", model=model)
+            except RateLimited:
+                raise
+            except LLMError as exc:
+                if "thinking" not in str(exc).lower():
+                    raise
+                plain = {**body, "generationConfig": {"temperature": temperature}}  # model without thought summaries
+                data = _post_with_retry(_ground_http, url, plain, headers, provider="gemini", model=model)
+        except LLMError as exc:
+            last = exc
+            if isinstance(exc, RateLimited) or any(k in str(exc).lower() for k in BUSY):
+                continue  # each model has its own quota: try the backup
+            raise
+        cand = (data.get("candidates") or [{}])[0]
+        parts = (cand.get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+        thoughts = " ".join(p.get("text", "") for p in parts if p.get("thought")).strip()
+        chunks = (cand.get("groundingMetadata") or {}).get("groundingChunks") or []
+        sources, seen = [], set()
+        for c in chunks:
+            web = c.get("web") or {}
+            title, uri = (web.get("title") or "").strip(), (web.get("uri") or "").strip()
+            if uri.startswith("https://") and title and title not in seen:
+                seen.add(title)
+                sources.append({"title": title[:80], "uri": uri})
+        return {"text": text, "thoughts": re.sub(r"\s+", " ", thoughts)[:600], "sources": sources[:5], "model": model}
+    raise last or LLMError("Gemini request failed")
+
+
 def describe() -> dict[str, Any]:
     s = config.settings
     llm = get_llm()
-    return {"provider": s.resolved_llm_provider, "model": llm.model if llm else None, "online": llm is not None}
+    g = get_gemini()
+    return {"provider": s.resolved_llm_provider, "model": llm.model if llm else None, "online": llm is not None,
+            "gemini": {"online": g is not None, "model": g.model if g else None}}

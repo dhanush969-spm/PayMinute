@@ -9,5 +9,4 @@ numpy>=1.26
 # Optional integrations (safe to keep installed; only used when configured)
 mcp>=1.12,<2
 kernel>=0.14
-phonenumbers>=8.13
 itsdangerous>=2.1

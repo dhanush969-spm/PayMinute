@@ -9,7 +9,15 @@ export interface Risk {
   recommendation: string;
   model?: { type: string; anomaly: number | null; trained_on: number; min_samples: number };
   suggested_category?: string;
+  email_check?: { status: "on_payminute" | "sandbox"; label: string; detail: string; name?: string | null };
 }
+
+/** PayMinute pays PayPal sandbox emails only (…@personal.example.com by default). */
+export function emailAllowed(email: string, domains: string[] = ["personal.example.com"]): boolean {
+  const e = email.trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && (!domains.length || domains.includes(e.split("@").pop()!));
+}
+export const emailRule = (domains: string[] = ["personal.example.com"]) => domains.map((d) => `…@${d}`).join(" or ");
 
 export interface Insight {
   state: "done" | "final" | "info" | "in_progress" | "overdue";
@@ -72,15 +80,7 @@ export interface Tx {
 
 export interface PayPalUser {
   name: string; email: string | null; payer_id: string | null; verified: boolean;
-  phone: string | null; phone_source: "paypal" | "user" | null;
-}
-
-export interface PhoneCheck {
-  input: string; valid: boolean; e164: string | null; display: string; country?: string; place?: string;
-  line_type?: string; network?: string | null; score?: number; level: "low" | "medium" | "high"; verdict: string;
-  payable: boolean;
-  paypal: { status: "verified" | "linked" | "not_on_paypal" | "unknown"; label: string; detail: string; name?: string | null; payer_id?: string };
-  signals: RiskReason[]; ai_summary?: string | null;
+  phone?: string | null; phone_source?: "paypal" | "user" | null;
 }
 
 export interface AppConfig {
@@ -90,7 +90,7 @@ export interface AppConfig {
   user: PayPalUser | null;
   session?: { idle_minutes: number; expires_at: number | null; ended: string | null };
   login_redirect_uri: string;
-  phone_region: string;
+  email_domains: string[];
   currency: string;
   locale?: string;
   business_name: string;
@@ -165,7 +165,7 @@ export function newRef(): string {
   return (crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`).replace(/-/g, "");
 }
 
-// name, else phone, else email
+// name, else email
 export function partyLabel(tx: Pick<Tx, "counterparty" | "counterparty_email" | "counterparty_phone">): string {
   return tx.counterparty || tx.counterparty_phone || tx.counterparty_email || "Unknown";
 }

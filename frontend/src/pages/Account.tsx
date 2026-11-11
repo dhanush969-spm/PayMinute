@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { BadgeCheck, ExternalLink, FileText, Mail, MapPin, Phone, RefreshCw, User, Wallet } from "lucide-react";
+import { BadgeCheck, ExternalLink, FileText, Mail, MapPin, RefreshCw, User, Wallet } from "lucide-react";
 import { api } from "../api";
 import { money } from "../format";
 import { useApp } from "../components/ui";
@@ -7,7 +7,7 @@ import { FormAlert } from "../components/form";
 
 interface Balance { currency: string; primary: boolean; total: number | null; available: number | null; withheld: number | null }
 interface AccountData {
-  profile: { name?: string; email?: string; phone?: string; phone_source?: string; verified?: boolean; payer_id?: string; account?: string; address?: string };
+  profile: { name?: string; email?: string; verified?: boolean; payer_id?: string; account?: string; address?: string };
   missing_scopes: { scope: string; gives: string }[];
   recommended_scopes: string;
   business: { account_id?: string; as_of?: string; balances: Balance[] } | null;
@@ -74,8 +74,6 @@ export default function Account() {
               <Row icon={User} label="Name" value={p?.name && p.name !== "PayPal user" ? p.name : null}
                 note={p?.verified ? <span className="text-xs text-emerald-700 flex items-center gap-1 mt-0.5"><BadgeCheck className="w-3.5 h-3.5" /> Verified PayPal account</span> : null} />
               <Row icon={Mail} label="PayPal email" value={p?.email} />
-              <Row icon={Phone} label="Phone" value={p?.phone}
-                note={p?.phone ? <span className="text-xs text-slate-500">{p.phone_source === "paypal" ? "From your PayPal profile" : "Added by you in PayMinute"}</span> : null} />
               <Row icon={MapPin} label="Location" value={p?.address} />
               <Row icon={Wallet} label="PayPal account ID" value={p?.payer_id || p?.account} />
               {acct.missing_scopes.length > 0 && (
@@ -84,7 +82,7 @@ export default function Account() {
                   <div>Your PayPal app only shares some details. To also get {acct.missing_scopes.map((m) => m.gives).join(", ")}:</div>
                   <ol className="list-decimal pl-4 space-y-0.5">
                     <li>Developer Dashboard → Apps &amp; Credentials (Sandbox) → your app → Log in with PayPal → Advanced options.</li>
-                    <li>Tick Full name, Email, Phone, Address and Account verification status / PayPal account ID, then Save.</li>
+                    <li>Tick Full name, Email, Address and Account verification status / PayPal account ID, then Save.</li>
                     <li>In <code>.env</code> set <code className="break-all">PAYPAL_LOGIN_SCOPES="{acct.recommended_scopes}"</code>, restart the backend and log in again.</li>
                   </ol>
                 </div>

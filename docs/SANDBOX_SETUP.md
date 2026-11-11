@@ -25,7 +25,7 @@ On the same app page, scroll to **Features** (sometimes called *Sandbox app sett
 | **Invoicing** | Assistant creates and sends invoices (PayPal Agent Toolkit) |
 | **Transaction search** | Activity → *Sync from PayPal* |
 
-| **Log in with PayPal** | Sign-in to PayMinute, and linking phone numbers to PayPal accounts |
+| **Log in with PayPal** | Sign-in to PayMinute, and linking each user's PayPal email to their account |
 
 If Payouts or Transaction Search returns `403 NOT_AUTHORIZED`, the feature isn't enabled yet. Enable it, save, and wait a minute.
 
@@ -35,7 +35,7 @@ Tick **Log in with PayPal**, then open **Advanced Settings**:
 | Setting | Value |
 |---|---|
 | **Return URL** | Local with Vite: `http://localhost:5173/api/auth/callback` · Local single server: `http://localhost:8000/api/auth/callback` · Render: `https://<your-app>.onrender.com/api/auth/callback` |
-| **Information requested from customers** | Full name, Email, **Phone number** (if offered), PayPal account ID (payer ID), account verification status |
+| **Information requested from customers** | Full name, **Email**, PayPal account ID (payer ID), account verification status |
 | Privacy policy URL / User agreement URL | Any page you control, e.g. your GitHub repo's README |
 
 The Return URL must match `APP_BASE_URL` + `/api/auth/callback` **exactly** (scheme, host, port), otherwise PayPal shows an "invalid redirect URI" error. Add one Return URL per place you run PayMinute.
@@ -46,16 +46,10 @@ Then set in `.env`: `AUTH_REQUIRED=true`, `APP_BASE_URL=…`, and a long random 
 **Testing Tools → Sandbox Accounts** already has two accounts. Create one more personal account (**Create account → Personal, United States**) so you have:
 - **Business** (`sb-…@business.example.com`): the app's merchant account. Payouts are sent **from** it and checkout money goes **to** it (that's how PayPal REST credentials work).
 - **Personal A** (`sb-…@personal.example.com`): **you**. Log in to PayMinute with it.
-- **Personal B**: the friend you'll pay by phone. Click **⋯ → View/Edit account** to see its password and its **phone number** (Profile tab).
+- **Personal B**: the friend you'll pay. Its email ends in `@personal.example.com`; click **⋯ → View/Edit account** to see its password.
 
-### How "pay by phone" works (and why)
-The PayPal **sandbox doesn't support Payouts to a raw phone number** (`recipient_type: PHONE` is live-only, see PayPal's Payouts API reference). PayPal also has no API that reveals who owns a number. So PayMinute verifies and pays numbers through **PayPal's identity service**:
-
-1. When someone logs in to PayMinute with PayPal, PayPal returns their profile (name, email, PayPal account ID and, with the `phone` scope, their **phone number**). PayMinute links that number to their PayPal account ID. If PayPal doesn't share a phone, they can add their own number from the account menu (shown as *added by you*, not *verified by PayPal*).
-2. When you type a number, **AI Guard** checks it: real and dialable? which country? mobile, VoIP or premium-rate? is it **verified by PayPal**, linked, or not linked yet? It adds these signals to the payment's fraud score and the LLM explains the result in one sentence.
-3. The payout goes to the linked **PayPal account ID** (`recipient_type: PAYPAL_ID`), which the sandbox supports. A number that isn't linked can't be paid: PayMinute tells you to ask them to log in once, or to pay their PayPal email.
-
-**To set it up for a demo:** log in to PayMinute once as **Personal B** (this links B's phone), log out, then log in as **Personal A** and pay B's phone number.
+### Who can be paid
+PayMinute pays PayPal sandbox emails only (`…@personal.example.com`; change it with `PAYPAL_EMAIL_DOMAINS`), never phone numbers. Log in once as Personal B so PayMinute links B's PayPal email to B's account; after that, payments to B show up in B's history too.
 
 ## 4. Webhooks (recommended)
 Webhooks push status changes, for example a pending eCheck completing or an unclaimed payout being claimed. PayPal needs a public HTTPS URL:
@@ -74,8 +68,8 @@ Copy the **Webhook ID** into `PAYPAL_WEBHOOK_ID`. PayMinute verifies every event
 ## 5. Scenarios to try in the sandbox
 | Scenario | How |
 |---|---|
-| **Pay by phone (verified by PayPal)** | Log in once as Personal B, then as A: **Pay** → B's phone number → *Verified by PayPal (B's name)* → $25 → `SUCCESS` |
-| Phone not linked | Pay `+1 415 555 0199` → AI Guard: *Not linked to PayPal yet*, the Pay button stays off |
+| **Pay by PayPal email** | Log in once as Personal B, then as A: **Pay** → B's PayPal email (`…@personal.example.com`) → AI Guard shows it's B's email → $25 → Pay |
+| Phone numbers and other emails refused | Pay `+1 415 555 0199` or `someone@gmail.com` → *PayMinute pays PayPal sandbox emails only* |
 | Risky number | Pay `+1 900 555 0199` (US premium-rate) → AI Guard: *don't pay yet* |
 | Normal payout by email | **Pay by PayPal email instead** → your personal sandbox email → `SUCCESS` |
 | **Unclaimed payout** (money left, not received) | Send $10 to an email that is **not** a PayPal sandbox account, e.g. `new.contractor@example.com` → `UNCLAIMED`. PayMinute explains it and offers **Cancel and get money back**. |
@@ -86,7 +80,8 @@ Copy the **Webhook ID** into `PAYPAL_WEBHOOK_ID`. PayMinute verifies every event
 | Invoice via AI | Assistant: "Invoice <personal sandbox email> $250 for logo design" → approve → the invoice appears in the personal account's sandbox inbox |
 | Transaction Search | Activity → **Sync from PayPal**. Sandbox reporting data can lag by up to about 3 hours. |
 
-## 6. AI tools (no extra key)
+## 6. AI tools
+- **Google Gemini** (bargaining): create a free key at https://aistudio.google.com/apikey and set `GEMINI_API_KEY=…` in `.env`. Gemini then runs every AI agent: AI Guard chat, market prices from the web (Google Search grounding), and each buyer and seller agent's moves and messages, inside the budget and floor limits enforced in code. The free tier has per-minute limits: when one is hit, PayMinute tries `gemini-2.5-flash`, then falls back to its built-in rules, shows a notice in the app and writes it to `payminute-ai.log`. Without a key everything runs on built-in rules.
 - AI Guard uses PayPal's sandbox MCP server (`PAYPAL_MCP=on`, the default) with your app's own token, plus the local PayPal Agent Toolkit. Nothing else to set up.
 - Optional free-form chat: `LLM_PROVIDER=anthropic` (or `openai`) and `LLM_API_KEY=…`.
 - For your coding agent: run `setup-paypal-ai-toolkit.command`, then in Claude Code `/plugin install paypal@claude-plugins-official` and `/paypal:setup`.

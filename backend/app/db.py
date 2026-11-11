@@ -124,14 +124,24 @@ CREATE TABLE IF NOT EXISTS agent_actions (
     decided_at TEXT
 );
 
--- Phone numbers linked to PayPal accounts. Filled when someone logs in to PayMinute with PayPal:
--- source 'paypal' = the number came from PayPal's own profile (userinfo phone_number),
--- source 'user'   = PayPal didn't share one and the signed-in user added it themselves.
+-- Older data: phone numbers that were linked to PayPal accounts. PayMinute now pays PayPal emails only
+-- (see paypal_emails); this table is only read to move old phone-based records to emails.
 CREATE TABLE IF NOT EXISTS paypal_directory (
     phone TEXT PRIMARY KEY,           -- E.164
     payer_id TEXT NOT NULL,
     name TEXT,
     email TEXT,
+    verified_account INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- PayPal emails of people who use PayMinute: payments go to a PayPal email, never a phone number.
+-- source 'paypal' = PayPal shared it at login, 'user' = the user added their own PayPal email.
+CREATE TABLE IF NOT EXISTS paypal_emails (
+    email TEXT PRIMARY KEY,           -- lower case
+    payer_id TEXT NOT NULL,
+    name TEXT,
     verified_account INTEGER NOT NULL DEFAULT 0,
     source TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -194,13 +204,28 @@ def init_db() -> None:
         for table in ("agent_actions", "agent_messages"):
             if "owner_account" not in {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN owner_account TEXT")
+        _move_phones_to_emails(conn)
+
+
+def _move_phones_to_emails(conn: sqlite3.Connection) -> None:
+    """PayMinute pays PayPal emails only. Older data that used phone numbers moves to the owner's email."""
+    conn.execute("INSERT OR IGNORE INTO paypal_emails (email, payer_id, name, verified_account, source, updated_at) "
+                 "SELECT lower(email), payer_id, name, verified_account, source, updated_at FROM paypal_directory "
+                 "WHERE email IS NOT NULL AND email LIKE '%@%'")
+    tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    for table, where in (("listings", "status='active'"), ("quotes", "status='open'"), ("jobs", "status!='paid'"),
+                         ("schedules", "1=1"), ("deals", "status='pending'")):
+        if table in tables:
+            conn.execute(f"UPDATE {table} SET payee = (SELECT lower(d.email) FROM paypal_directory d WHERE d.phone = {table}.payee) "
+                         f"WHERE {where} AND payee LIKE '+%' AND EXISTS (SELECT 1 FROM paypal_directory d "
+                         f"WHERE d.phone = {table}.payee AND d.email IS NOT NULL)")
 
 
 def reset_db() -> None:
     with connect() as conn:
         for table in [
             "transactions", "status_history", "budgets", "category_memory",
-            "webhook_events", "agent_messages", "agent_actions", "paypal_directory",
+            "webhook_events", "agent_messages", "agent_actions", "paypal_directory", "paypal_emails",
             "jobs", "schedules", "agent_runs", "deals", "automation_settings", "listings", "quotes", "session_versions",
         ]:
             conn.execute(f"DELETE FROM {table}")
@@ -269,7 +294,8 @@ def insert_tx(data: dict[str, Any]) -> dict[str, Any]:
     me = CURRENT.get() or {}
     tx["owner_account"] = tx.get("owner_account") or me.get("account")
     tx["owner_name"] = tx.get("owner_name") or me.get("name") or (
-        (phone_for_payer(tx["owner_account"]) or {}).get("name") if tx["owner_account"] else None)
+        (email_for_payer(tx["owner_account"]) or phone_for_payer(tx["owner_account"]) or {}).get("name")
+        if tx["owner_account"] else None)
     if isinstance(tx.get("risk_reasons"), (list, tuple)):
         tx["risk_reasons"] = json.dumps(tx["risk_reasons"])
     cols = ",".join(TX_FIELDS)
@@ -528,9 +554,39 @@ def account_for_email(email: str | None) -> str | None:
     """The PayMinute account behind a PayPal email, if that person has logged in to PayMinute."""
     if not email:
         return None
+    found = find_email(email)
+    if found:
+        return found["payer_id"]
     with connect() as conn:
         row = conn.execute("SELECT payer_id FROM paypal_directory WHERE lower(email) = lower(?) LIMIT 1", (email,)).fetchone()
     return row["payer_id"] if row else None
+
+
+def link_email(email: str, payer_id: str, name: str | None, verified: bool, source: str) -> None:
+    """Remember a user's own PayPal email (one per account)."""
+    with connect() as conn:
+        conn.execute("DELETE FROM paypal_emails WHERE payer_id = ? AND email != ?", (payer_id, email.lower()))
+        conn.execute(
+            "INSERT INTO paypal_emails (email, payer_id, name, verified_account, source, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET payer_id=excluded.payer_id, name=excluded.name, "
+            "verified_account=excluded.verified_account, source=excluded.source, updated_at=excluded.updated_at",
+            (email.lower(), payer_id, name, 1 if verified else 0, source, now_iso()))
+
+
+def find_email(email: str | None) -> dict[str, Any] | None:
+    if not email:
+        return None
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM paypal_emails WHERE email = lower(?)", (email.strip(),)).fetchone()
+    return dict(row) if row else None
+
+
+def email_for_payer(payer_id: str | None) -> dict[str, Any] | None:
+    if not payer_id:
+        return None
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM paypal_emails WHERE payer_id = ?", (payer_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def phone_for_payer(payer_id: str) -> dict[str, Any] | None:

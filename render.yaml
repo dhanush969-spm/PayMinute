@@ -15,6 +15,8 @@ services:
         value: none
       - key: LLM_API_KEY
         sync: false
+      - key: GEMINI_API_KEY
+        sync: false
       - key: APP_BASE_URL
         sync: false
       - key: SESSION_SECRET

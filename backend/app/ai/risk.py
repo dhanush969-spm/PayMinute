@@ -287,7 +287,7 @@ def recommendation(direction: str, level: str, reasons: list[dict[str, Any]]) ->
             return ("Contact the recipient through a channel you already trust (not one from this request) before "
                     "sending. Money sent to a scammer is very hard to get back.")
         if level == "medium":
-            return "Double-check who you're paying (their phone number or email) and the amount before sending."
+            return "Double-check who you're paying (their PayPal email) and the amount before sending."
         return "Looks normal for you. Safe to continue."
     if "duplicate" in codes:
         return "The customer may have paid twice. Capture one payment and void or refund the other."

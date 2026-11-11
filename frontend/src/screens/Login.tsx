@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { BadgeCheck, ShieldCheck, Phone, Sparkles, TriangleAlert } from "lucide-react";
-import { api, type AppConfig, type PayPalUser } from "../api";
+import { AtSign, BadgeCheck, ShieldCheck, Sparkles, TriangleAlert } from "lucide-react";
+import { api, type AppConfig, type PayPalUser, emailAllowed, emailRule } from "../api";
 
 function Shell({ children }: { children: React.ReactNode }) {
   return (
@@ -26,8 +26,8 @@ export function LoginScreen({ notice }: { notice?: string | null }) {
     <Shell>
       <div className="space-y-3">
         {[
-          { icon: Phone, text: "Pay anyone by phone number through PayPal Payouts" },
-          { icon: ShieldCheck, text: "AI Guard verifies the number and checks every payment for scams before money moves" },
+          { icon: AtSign, text: "Pay anyone by their PayPal email through PayPal Payouts" },
+          { icon: ShieldCheck, text: "AI Guard checks every payment for scams, duplicates and unusual amounts before money moves" },
           { icon: Sparkles, text: "Ask the assistant about stuck payments, spending and invoices" },
         ].map((f) => (
           <div key={f.text} className="flex items-start gap-3 text-sm text-slate-700">
@@ -67,48 +67,41 @@ export function SetupScreen({ config }: { config: AppConfig }) {
   );
 }
 
-// your phone number, so others can pay you by phone
-export function MyPhone({ user, onSaved, toast }: { user: PayPalUser; onSaved: () => void; toast: (m: string, k?: "error") => void }) {
-  const [value, setValue] = useState("");
+// your own PayPal email, so other people's payments reach you
+export function MyPayPalEmail({ user, onSaved, toast }: { user: PayPalUser; onSaved: () => void; toast: (m: string, k?: "error") => void }) {
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
-  if (user.phone) {
+  if (user.email) {
     return (
-      <div className="text-xs text-black flex items-center gap-1.5">
-        <Phone className="w-3.5 h-3.5 text-slate-500" /> {user.phone}
-        {user.phone_source === "paypal"
-          ? <span className="text-emerald-700 flex items-center gap-0.5"><BadgeCheck className="w-3.5 h-3.5" /> from PayPal</span>
-          : <span className="text-slate-500">(added by you)</span>}
+      <div className="text-xs text-black flex items-center gap-1.5 break-all">
+        <AtSign className="w-3.5 h-3.5 text-slate-500 shrink-0" /> {user.email}
+        <span className="text-emerald-700 flex items-center gap-0.5 shrink-0"><BadgeCheck className="w-3.5 h-3.5" /> PayPal</span>
       </div>
     );
   }
-  const needEmail = !user.email;
   const needName = !user.name || user.name === "PayPal user";
   async function save() {
-    const digits = value.match(/\d/g)?.length ?? 0;
+    const e = email.trim().toLowerCase();
     const problem = needName && !name.trim() ? "Enter your name."
-      : needEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) ? "Enter the email of your PayPal account."
-      : digits < 7 ? "Enter your phone number with its country code, e.g. +1 408 555 0134." : null;
+      : !emailAllowed(e) ? `Enter the email of your PayPal sandbox account (${emailRule()}).` : null;
     if (problem) { toast(problem, "error"); return; }
     setBusy(true);
     try {
-      await api.post("/auth/phone", { phone: value, email: needEmail ? email : undefined, name: needName ? name : undefined });
-      toast("Your number is linked to your PayPal account");
+      await api.post("/auth/payout", { email: e, name: needName ? name : undefined });
+      toast("Saved. Payments to this PayPal email now reach you.");
       onSaved();
-    } catch (e) { toast(`Couldn't save your number: ${(e as Error).message}`, "error"); }
+    } catch (err) { toast(`Couldn't save your PayPal email: ${(err as Error).message}`, "error"); }
     finally { setBusy(false); }
   }
   const field = "w-full min-w-0 bg-slate-50 border border-slate-200 rounded-xl px-2.5 py-1.5 text-xs text-black outline-none";
   return (
     <div className="space-y-1.5">
-      <div className="text-[11px] text-slate-500">Add your phone so people can pay you by phone:</div>
+      <div className="text-[11px] text-slate-500">Add your PayPal sandbox email so people can pay you:</div>
       {needName && <input className={field} placeholder="Your name" value={name} onChange={(e) => setName(e.target.value)} aria-label="Your name" />}
-      {needEmail && <input className={field} type="email" placeholder="Your PayPal email" value={email} onChange={(e) => setEmail(e.target.value)} aria-label="Your PayPal email" />}
       <div className="flex gap-1.5">
-        <input className={`${field} flex-1`} type="tel" placeholder="+1 408 555 0134" value={value} onChange={(e) => setValue(e.target.value)} aria-label="Your phone number" />
-        <button className="gbtn px-3 rounded-xl bg-[#1a73e8] text-white text-xs disabled:opacity-50"
-          disabled={busy} onClick={save}>Save</button>
+        <input className={`${field} flex-1`} type="email" placeholder="you@personal.example.com" value={email} onChange={(e) => setEmail(e.target.value)} aria-label="Your PayPal email" />
+        <button className="gbtn px-3 rounded-xl bg-[#1a73e8] text-white text-xs disabled:opacity-50" disabled={busy} onClick={save}>Save</button>
       </div>
     </div>
   );

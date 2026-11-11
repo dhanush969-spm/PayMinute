@@ -13,11 +13,17 @@ export const amountError = (raw: string, label = "an amount", max = 20000): stri
 };
 
 export const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-export const payeeError = (raw: string, who = "the recipient's"): string | null => {
-  const v = raw.trim();
-  if (!v) return `Enter ${who} phone number or PayPal email.`;
-  if (/[@a-z]/i.test(v)) return EMAIL_RE.test(v) ? null : "That PayPal email doesn't look right.";
-  return (v.match(/\d/g)?.length ?? 0) >= 7 ? null : "Enter the full phone number with its country code, e.g. +1 408 555 0134.";
+// PayMinute pays PayPal sandbox emails only (…@personal.example.com by default), never phone numbers
+export const payeeError = (raw: string, whoOrDomains: string | string[] = "the recipient's", domains: string[] = ["personal.example.com"]): string | null => {
+  const who = typeof whoOrDomains === "string" ? whoOrDomains : "the recipient's";
+  const allowed = Array.isArray(whoOrDomains) ? whoOrDomains : domains;
+  const rule = allowed.map((d) => `…@${d}`).join(" or ");
+  const v = raw.trim().toLowerCase();
+  if (!v) return `Enter ${who} PayPal email (${rule}).`;
+  if (!v.includes("@") && (v.match(/\d/g)?.length ?? 0) >= 7) return `PayMinute pays PayPal emails only, not phone numbers. Use ${who} PayPal email (${rule}).`;
+  if (!EMAIL_RE.test(v)) return "That PayPal email doesn't look right.";
+  if (allowed.length && !allowed.includes(v.split("@").pop()!)) return `Only PayPal sandbox emails (${rule}) can be paid.`;
+  return null;
 };
 
 /** Keep only the errors that are set. */

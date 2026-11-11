@@ -22,6 +22,14 @@ from .paypal.client import PayPalError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("payminute")
 
+# Gemini / AI model problems (rate limits, errors) also go to payminute-ai.log next to the database
+with contextlib.suppress(OSError):
+    _ai_log = logging.FileHandler(Path(config.settings.database_path).with_name("payminute-ai.log"))
+    _ai_log.setLevel(logging.WARNING)
+    _ai_log.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    for _name in ("payminute.llm", "payminute.negotiator", "payminute.agent"):
+        logging.getLogger(_name).addHandler(_ai_log)
+
 FRONTEND_DIST = config.ROOT_DIR / "frontend" / "dist"
 
 

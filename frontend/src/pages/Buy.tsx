@@ -5,11 +5,11 @@ import { api } from "../api";
 import { money } from "../format";
 import { useApp } from "../components/ui";
 import { Errors, FieldError, FormAlert, amountError, collect, invalid, report } from "../components/form";
-import { Candidate, Chips, Listing, Msg, Parsed, PriceHint, PriceInput, Quote, TrustBadge, field, parsePrompt, primary } from "./Market";
+import { AiNote, Candidate, Chips, GeminiReadView, Listing, MarketPrice, MarketView, Msg, Parsed, PriceHint, PriceInput, Quote, Thinking, TrustBadge, WebSource, field, parsePrompt, primary } from "./Market";
 
 type Ev =
   | { type: "understood"; request: Parsed["request"]; budget: number | null; fair: PriceHint | null }
-  | { type: "stage"; text: string }
+  | { type: "stage"; text: string; by?: string; thinking?: string; note?: string; sources?: WebSource[]; market?: MarketPrice[] }
   | { type: "candidates"; candidates: Candidate[] }
   | { type: "pick"; listing: Candidate; fair: number | null; reason: string; text: string }
   | ({ type: "message" } & Msg)
@@ -58,9 +58,11 @@ function Bubble({ m }: { m: Msg }) {
   return (
     <div className={`flex ${mine ? "justify-end" : "justify-start"} animate-[fadeIn_.25s_ease-out]`}>
       <div className={`max-w-[85%] px-3.5 py-2 rounded-2xl text-sm ${mine ? "bg-[#1a73e8] text-white rounded-br-md" : "bg-slate-100 text-black rounded-bl-md"}`}>
-        <div className="text-[10px] opacity-75 flex justify-between gap-3"><span>{mine ? "Your agent" : "Seller's agent"}</span>{m.action !== "ask" && m.amount ? <span>{money(m.amount)}</span> : null}</div>
+        <div className="text-[10px] opacity-75 flex justify-between gap-3"><span>{mine ? "Your agent" : "Seller's agent"}{m.by === "gemini" ? " · Gemini" : m.by === "rules" ? " · rules" : ""}</span>{m.action !== "ask" && m.amount ? <span>{money(m.amount)}</span> : null}</div>
         {m.text}
+        {m.thinking && <Thinking text={m.thinking} light={mine} />}
       </div>
+      {m.note && <AiNote text={m.note} />}
     </div>
   );
 }
@@ -76,6 +78,7 @@ export default function Buy() {
   const [failure, setFailure] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [stages, setStages] = useState<string[]>([]);
+  const [web, setWeb] = useState<{ sources?: WebSource[]; market?: MarketPrice[] } | null>(null);
   const [cands, setCands] = useState<Candidate[]>([]);
   const [pick, setPick] = useState<Extract<Ev, { type: "pick" }> | null>(null);
   const [talk, setTalk] = useState<Msg[]>([]);
@@ -100,7 +103,15 @@ export default function Buy() {
         }
       }).catch(() => undefined);
     }, 450);
-    return () => clearTimeout(t);
+    // once the user stops typing, Gemini reads it too (one call, so the free tier's rate limit lasts)
+    const g = setTimeout(() => {
+      parsePrompt(prompt, "buy", true).then((p) => {
+        if (!p.gemini) return;
+        setParsed(p);
+        if (!budgetTouched && !p.request.price && p.suggestion?.price) setBudget(String(p.suggestion.price));
+      }).catch(() => undefined);
+    }, 1500);
+    return () => { clearTimeout(t); clearTimeout(g); };
   }, [prompt]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // after a deal, count down and open the locked checkout
@@ -148,7 +159,7 @@ export default function Buy() {
   }
 
   function handle(ev: Ev) {
-    if (ev.type === "stage") setStages((s) => [...s, ev.text]);
+    if (ev.type === "stage") { setStages((s) => [...s, ev.text]); if (ev.sources?.length || ev.market?.length) setWeb({ sources: ev.sources, market: ev.market }); }
     else if (ev.type === "candidates") setCands(ev.candidates);
     else if (ev.type === "pick") { setPick(ev); setTalk([]); setStages((s) => [...s, ev.text]); }
     else if (ev.type === "message") setTalk((t) => [...t, ev]);
@@ -168,7 +179,7 @@ export default function Buy() {
     });
     setErr(errors);
     if (!report(errors, toast, formRef.current)) return;
-    setRunning(true); setStages([]); setCands([]); setPick(null); setTalk([]); setDone(null); setCountdown(null);
+    setRunning(true); setStages([]); setWeb(null); setCands([]); setPick(null); setTalk([]); setDone(null); setCountdown(null);
     queue.current = [];
     try {
       const res = await fetch("/api/market/shop/stream", {
@@ -230,6 +241,7 @@ export default function Buy() {
               <div className="text-xs text-slate-500">Your agent understood</div>
               <div className="text-sm text-black">{req.title || "—"}</div>
               {req.wanted.length > 0 ? <Chips items={req.wanted} /> : <div className="text-xs text-slate-500">No specific features or condition. Add some (e.g. “like new, 2 lenses”) and the agent will check every listing for them.</div>}
+              <GeminiReadView g={parsed?.gemini} />
               {hint && (
                 <div className="text-xs text-[#174ea6] flex items-start gap-1.5 pt-1">
                   <Sparkles className="w-3.5 h-3.5 shrink-0 mt-0.5" />
@@ -260,6 +272,7 @@ export default function Buy() {
                 </div>
               ))}
               {busy && !stages.length && <div className="text-sm text-slate-500">Reading your request…</div>}
+              {web && <div className="pl-6"><MarketView market={web.market} sources={web.sources} /></div>}
             </div>
             {cands.length > 0 && <div className="text-xs text-slate-500 px-1">Compared {cands.length} listing{cands.length > 1 ? "s" : ""}: features you asked for are ✓ / ✗</div>}
             <div className="grid gap-3 md:grid-cols-2">

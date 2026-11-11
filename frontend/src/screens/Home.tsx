@@ -50,7 +50,7 @@ export default function GHome() {
     <div className="space-y-4">
       <button className="gbtn w-full bg-white p-3.5 rounded-full border border-slate-200 flex items-center gap-3 hover:bg-slate-50" onClick={() => openSend()}>
         <Search className="w-4 h-4 text-slate-500 ml-2" />
-        <span className="text-sm text-slate-500">Pay any phone number or PayPal email</span>
+        <span className="text-sm text-slate-500">Pay any PayPal email (…@personal.example.com)</span>
       </button>
 
       <div className="grid gap-4 lg:grid-cols-3 lg:items-start">
@@ -137,7 +137,7 @@ export default function GHome() {
           <button className="gbtn text-xs text-[#1a73e8]" onClick={() => openSend()}>New payment</button>
         </div>
         {people.length === 0 ? (
-          <div className="text-sm text-slate-500">People you pay by phone will appear here. <button className="gbtn text-[#1a73e8]" onClick={() => openSend()}>Pay someone</button></div>
+          <div className="text-sm text-slate-500">People you pay will appear here. <button className="gbtn text-[#1a73e8]" onClick={() => openSend()}>Pay someone</button></div>
         ) : (
           <div className="grid grid-cols-4 sm:grid-cols-6 lg:grid-cols-4 gap-y-4 gap-x-2">
             {people.map((p) => (
@@ -154,7 +154,7 @@ export default function GHome() {
         <div className="p-2.5 bg-emerald-100 rounded-2xl text-emerald-700 shrink-0"><ShieldCheck className="w-5 h-5" /></div>
         <div className="flex-1">
           <div className="text-sm text-emerald-900">AI Risk Shield is on</div>
-          <div className="text-xs text-emerald-800">Every phone number is verified and every payment is checked for scams, duplicates and unusual amounts before money moves{data && data.risk_blocked_count > 0 ? ` · ${data.risk_blocked_count} high-risk caught` : ""}.</div>
+          <div className="text-xs text-emerald-800">Payments only go to PayPal sandbox emails, and every payment is checked for scams, duplicates and unusual amounts before money moves{data && data.risk_blocked_count > 0 ? ` · ${data.risk_blocked_count} high-risk caught` : ""}.</div>
         </div>
       </div>
 

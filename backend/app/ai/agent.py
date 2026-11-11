@@ -12,13 +12,17 @@ from .. import config, db, ledger
 from ..paypal import service as pp
 from ..paypal.client import PayPalError
 from . import intent as intent_mod
-from . import categorize, phone as phone_ai, insights, risk, status as status_ai
-from .llm import LLMError, get_llm
+from . import categorize, insights, risk, status as status_ai
+from .llm import LLMError, RateLimited, get_llm
+from .llm import feature as llm_feature
 from ..integrations import mcp_bridge
 
 log = logging.getLogger("payminute.agent")
 # the signed-in PayPal user for the current request (set by the API)
 CURRENT_USER: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar("current_user", default=None)
+# set when the user's own message asked for an invoice or a bill split: that message is the approval to send it
+ASKED_TO_INVOICE: contextvars.ContextVar[bool] = contextvars.ContextVar("asked_to_invoice", default=False)
+INVOICE_ASK = re.compile(r"\b(invoice|bill|split|halves|divide|request (?:money|payment)|charge)\b", re.I)
 MAX_STEPS = 6
 
 
@@ -34,11 +38,8 @@ for fraud/scam risk, create and send PayPal invoices, and send money via PayPal 
 
 Rules:
 - Use tools for every fact about the user's money; never invent amounts, statuses or IDs.
-- People are paid by phone number (PayPal Payouts, recipient type PHONE) or by PayPal email. When the receiver is a
-  phone number, ALWAYS call verify_phone first and tell the user what PayPal knows about the number (verified by
-  PayPal / linked / not linked yet), the line type and country. Only name the owner if verify_phone returns a name.
-  If verify_phone says payable=false, do NOT call send_money: explain the number must be linked to a PayPal account
-  first (its owner logs in to PayMinute with PayPal once) or ask for their PayPal email.
+- People are paid by PayPal email only, and only PayPal sandbox emails ending in {s.email_rule.replace('…', '')}.
+  Never pay a phone number: if the user gives one, ask for that person's PayPal email instead.
 - Before sending money ALWAYS call check_payment_risk first and mention the risk level in your reply.
 - Actions that move money or email someone are queued for the user's approval; tell the user to review the
   approval card. Never claim money was sent until a tool result says it was executed.
@@ -114,18 +115,12 @@ def t_explain(args: dict) -> Any:
 
 
 def _receiver(args: dict) -> str:
-    return str(args.get("receiver") or args.get("receiver_email") or args.get("phone") or "").strip()
+    return str(args.get("receiver") or args.get("receiver_email") or "").strip()
 
 
 def t_check_risk(args: dict) -> Any:
     a = ledger.assess_payout(_receiver(args), float(args["amount"]), args.get("note"), args.get("name"))
     return {k: a.get(k) for k in ("score", "level", "reasons", "duplicates", "recommendation", "model", "recipient")}
-
-
-def t_verify_phone(args: dict) -> Any:
-    r = phone_ai.analyze(_receiver(args), ledger.history(), args.get("amount"))
-    return {k: r.get(k) for k in ("input", "valid", "payable", "display", "e164", "country", "place", "line_type", "network",
-                                  "paypal", "signals", "level", "verdict")}
 
 
 def t_recommendations(_: dict) -> Any:
@@ -208,15 +203,9 @@ PAYMINUTE_TOOLS: dict[str, dict[str, Any]] = {
     "explain_payment": dict(
         description="Explain one payment's status, risk reasons and status history. Pass transaction_id or search.",
         parameters=_obj({"transaction_id": {"type": "string"}, "search": {"type": "string"}}), handler=t_explain),
-    "verify_phone": dict(
-        description="AI Guard phone check before paying a phone number: validity, country, line type (mobile, VoIP, "
-                    "premium…), what PayPal reported for earlier payouts to it (verified / no PayPal account) and a risk level.",
-        parameters=_obj({"receiver": {"type": "string", "description": "phone number, ideally with country code"},
-                         "amount": {"type": "number"}}, ["receiver"]),
-        handler=t_verify_phone),
     "check_payment_risk": dict(
         description="Score an outgoing payment for fraud/scam/duplicate risk BEFORE sending. Returns level and reasons.",
-        parameters=_obj({"receiver": {"type": "string", "description": "phone number (+15555550123) or PayPal email"},
+        parameters=_obj({"receiver": {"type": "string", "description": "PayPal email (…@personal.example.com)"},
                          "amount": {"type": "number"},
                          "note": {"type": "string"}, "name": {"type": "string"}}, ["receiver", "amount"]),
         handler=t_check_risk),
@@ -230,9 +219,9 @@ PAYMINUTE_TOOLS: dict[str, dict[str, Any]] = {
         description="Import the last 31 days of PayPal account activity via the Transaction Search API.",
         parameters=_obj({}), handler=t_sync),
     "send_money": dict(
-        description="Send money to a phone number or PayPal email via PayPal Payouts. REQUIRES USER APPROVAL: this "
+        description="Send money to a PayPal sandbox email (…@personal.example.com) via PayPal Payouts. REQUIRES USER APPROVAL: this "
                     "queues an approval card.",
-        parameters=_obj({"receiver": {"type": "string", "description": "phone number (+15555550123) or PayPal email"},
+        parameters=_obj({"receiver": {"type": "string", "description": "PayPal email (…@personal.example.com)"},
                          "amount": {"type": "number"},
                          "note": {"type": "string", "description": "message shown to the receiver"},
                          "name": {"type": "string", "description": "receiver's name if known"}},
@@ -241,7 +230,7 @@ PAYMINUTE_TOOLS: dict[str, dict[str, Any]] = {
     "create_job": dict(
         description="Create a job for a contractor. When it's marked complete, PayMinute pays them automatically "
                     "(within the user's agent limits and only if the risk check passes).",
-        parameters=_obj({"title": {"type": "string"}, "payee": {"type": "string", "description": "phone or PayPal email"},
+        parameters=_obj({"title": {"type": "string"}, "payee": {"type": "string", "description": "PayPal email (…@personal.example.com)"},
                          "amount": {"type": "number"}, "payee_name": {"type": "string"}}, ["title", "payee", "amount"]),
         handler=lambda a: __import__("app.automation", fromlist=["x"]).create_job(a["title"], a["payee"], float(a["amount"]), a.get("payee_name"))),
     "complete_job": dict(
@@ -257,7 +246,7 @@ PAYMINUTE_TOOLS: dict[str, dict[str, Any]] = {
         handler=lambda a: _schedule(a)),
     "negotiate_and_pay": dict(
         description="Buyer agent negotiates with the seller's agent within the budget and pays the agreed price via PayPal.",
-        parameters=_obj({"item": {"type": "string"}, "seller": {"type": "string", "description": "seller phone or PayPal email"},
+        parameters=_obj({"item": {"type": "string"}, "seller": {"type": "string", "description": "seller PayPal email (…@personal.example.com)"},
                          "budget": {"type": "number"}}, ["item", "seller", "budget"]),
         handler=lambda a: __import__("app.automation", fromlist=["x"]).negotiate(a["item"], a["seller"], float(a["budget"]))),
     "shop_for_me": dict(
@@ -325,10 +314,24 @@ def tool_source(name: str) -> str:
     return spec["source"] if spec else "paypal-agent-toolkit"
 
 
+# A draft invoice moves no money and emails no one, so it never needs a card. Sending one emails the
+# recipient a request to pay; that runs without a card only when the user's own message asked for it.
+NO_APPROVAL = {"create_invoice"}
+OK_WHEN_ASKED = {"send_invoice"}
+
+
+def base_name(name: str) -> str:
+    spec = _mcp_spec(name)
+    return spec["remote_name"] if spec else name
+
+
 def needs_approval(name: str) -> bool:
     if name in PAYMINUTE_TOOLS:
         return bool(PAYMINUTE_TOOLS[name].get("approval"))
-    if name in TOOLKIT_APPROVAL:
+    base = base_name(name)
+    if base in NO_APPROVAL or (base in OK_WHEN_ASKED and ASKED_TO_INVOICE.get()):
+        return False
+    if name in TOOLKIT_APPROVAL or base in TOOLKIT_APPROVAL:
         return True
     spec = _mcp_spec(name)
     return bool(spec and spec["approval"])
@@ -423,21 +426,40 @@ def run_tool(name: str, args: dict[str, Any]) -> Any:
         result = _only_mine(base, mcp_bridge.call(name, clean))
     else:
         result = _only_mine(base, pp.get_toolkit().run(name, clean))
-    if name == "create_invoice":
+    if base == "create_invoice":
         _record_invoice(clean, result)
-    elif name == "send_invoice" and clean.get("invoice_id"):
+    elif base == "send_invoice" and clean.get("invoice_id"):
         tx = db.find_tx(paypal_invoice_id=clean["invoice_id"])
         if tx:
             db.update_tx(tx["id"], status="SENT", _source="paypal")
-    elif name == "cancel_sent_invoice" and clean.get("invoice_id"):
+    elif base == "cancel_sent_invoice" and clean.get("invoice_id"):
         tx = db.find_tx(paypal_invoice_id=clean["invoice_id"])
         if tx:
             db.update_tx(tx["id"], status="CANCELLED", _source="paypal")
     return result
 
 
+def _invoice_bits(args: dict[str, Any]) -> tuple[str | None, float | None]:
+    """Who an invoice is for and its total, from the tool arguments."""
+    to = None
+    for r in args.get("primary_recipients") or []:
+        to = ((r or {}).get("billing_info") or {}).get("email_address") or to
+    total = 0.0
+    for it in args.get("items") or []:
+        try:
+            total += float((it.get("unit_amount") or {}).get("value") or 0) * float(it.get("quantity") or 1)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return to, (round(total, 2) or None)
+
+
 def summarize_action(name: str, args: dict[str, Any]) -> tuple[str, dict | None]:
+    """The approval card's text, in plain words (never the raw tool call)."""
     cur = config.settings.currency
+    name = base_name(name)
+    if name == "create_invoice":
+        to, total = _invoice_bits(args)
+        return (f"Create a PayPal invoice" + (f" for {total:,.2f} {cur}" if total else "") + (f" to {to}" if to else ""), None)
     if name == "send_money":
         a = ledger.assess_payout(_receiver(args), float(args.get("amount") or 0), args.get("note"),
                                  args.get("name"))
@@ -464,11 +486,10 @@ def summarize_action(name: str, args: dict[str, Any]) -> tuple[str, dict | None]
         return f"Send a payment reminder for invoice {args.get('invoice_id')}", None
     if name == "cancel_sent_invoice":
         return f"Cancel sent invoice {args.get('invoice_id')}", None
-    spec = _mcp_spec(name)
-    if spec:
-        shown = ", ".join(f"{k}={str(v)[:60]}" for k, v in list(args.items())[:4])
-        return f"Run {spec['remote_name']} on the {spec['server']} MCP server ({shown})", None
-    return f"Run {name}", None
+    what = name.replace("_", " ").strip().capitalize()
+    amount = next((args[k] for k in ("amount", "value", "total") if isinstance(args.get(k), (int, float, str)) and str(args.get(k))), None)
+    ref = next((args[k] for k in ("invoice_id", "order_id", "id") if args.get(k)), None)
+    return f"{what} with PayPal" + (f" ({ref})" if ref else "") + (f" for {amount} {cur}" if amount else ""), None
 
 
 def _short(result: Any, limit: int = 6000) -> str:
@@ -510,6 +531,14 @@ def _history_for_llm(session_id: str) -> list[dict[str, Any]]:
 
 
 def run_turn(session_id: str, text: str, user_name: str | None = None) -> dict[str, Any]:
+    token = ASKED_TO_INVOICE.set(bool(INVOICE_ASK.search(text)))
+    try:
+        return _run_turn(session_id, text, user_name)
+    finally:
+        ASKED_TO_INVOICE.reset(token)
+
+
+def _run_turn(session_id: str, text: str, user_name: str | None = None) -> dict[str, Any]:
     db.add_agent_message(session_id, {"role": "user", "content": text})
     llm = get_llm()
     if llm is None:
@@ -520,7 +549,8 @@ def run_turn(session_id: str, text: str, user_name: str | None = None) -> dict[s
     reply = ""
     try:
         for _ in range(MAX_STEPS):
-            res = llm.chat(messages, tools=specs, system=system_prompt(user_name))
+            with llm_feature("AI Guard chat"):
+                res = llm.chat(messages, tools=specs, system=system_prompt(user_name))
             if not res["tool_calls"]:
                 reply = res["content"].strip()
                 break
@@ -537,17 +567,20 @@ def run_turn(session_id: str, text: str, user_name: str | None = None) -> dict[s
             reply = "I ran out of steps for this request. Could you narrow it down?"
     except LLMError as exc:
         log.error("LLM error: %s", exc)
+        limited = isinstance(exc, RateLimited)
         if not steps:
             # model down: answer with the built-in planner instead of an error
             out = offline_turn(session_id, text)
-            out["reply"] = "_The AI model is busy right now, so I used PayMinute's built-in planner._\n\n" + out["reply"]
+            why = (f"{llm.model} hit its rate limit" if limited else "The AI model is busy right now")
+            out["reply"] = f"_{why}, so I used PayMinute's built-in planner._\n\n" + out["reply"]
+            out["notice"] = {"kind": "rate_limit" if limited else "error", "text": why + "."}
             return out
         reply = "The AI model stopped responding partway through. Anything waiting for approval is listed below."
     if not reply:
         reply = "Done."
     db.add_agent_message(session_id, {"role": "assistant", "content": reply})
     return {"reply": reply, "steps": steps, "pending_actions": [s["action"] for s in steps if s.get("queued")],
-            "mode": "llm"}
+            "mode": "llm", "model": llm.model, "provider": llm.provider}
 
 
 def decide_action(action_id: str, approve: bool) -> dict[str, Any]:
@@ -594,17 +627,6 @@ def _first_href(result: Any) -> str | None:
     return None
 
 
-def _phone_line(v: dict[str, Any]) -> str:
-    if not v.get("valid"):
-        why = "; ".join(x["detail"] for x in v.get("signals", [])) or "It isn't a dialable number."
-        return f"**Phone check — {v.get('input')}:** not a valid phone number. {why} {v.get('verdict')}"
-    pp = v.get("paypal") or {}
-    flags = "\n".join(f"- **{x['label']}**: {x['detail']}" for x in v.get("signals", []))
-    return (f"**Phone check — {v.get('display')}** ({v.get('place')}, {v.get('line_type')}"
-            f"{', ' + v['network'] if v.get('network') else ''})\n- **PayPal:** {pp.get('label')}"
-            f"{' — ' + pp['name'] if pp.get('name') else ''}. {pp.get('detail')}"
-            + (f"\n{flags}" if flags else "") + f"\n\nAI Guard: **{v.get('level', '?').upper()}**. {v.get('verdict')}")
-
 AMOUNT_RE = re.compile(r"(?:\$|usd\s*|₹|rs\.?\s*)?(\d+(?:,\d{3})*(?:\.\d{1,2})?)", re.I)
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 # e.g. +1 408 555 0134 or (408) 555-0134
@@ -639,20 +661,18 @@ DEAL_WORDS = re.compile(r"\b(negotiat\w*|haggle|bargain|best price|deal)\b", re.
 
 
 def _contacts() -> list[dict[str, Any]]:
+    """People the user can name ("pay Priya"): PayMinute users' PayPal emails and people they've paid by email."""
     seen: dict[str, dict[str, Any]] = {}
     with db.connect() as conn:
-        for r in conn.execute("SELECT phone, name, email FROM paypal_directory").fetchall():
-            seen[r["phone"]] = {"name": r["name"], "phone": r["phone"], "email": r["email"]}
+        for r in conn.execute("SELECT email, name FROM paypal_emails").fetchall():
+            seen[r["email"]] = {"name": r["name"], "email": r["email"], "phone": None}
     for t in ledger.history():
-        if t.get("direction") == "out" and t.get("counterparty") and (t.get("counterparty_phone") or t.get("counterparty_email")):
-            key = t.get("counterparty_phone") or t["counterparty_email"]
-            seen.setdefault(key, {"name": t["counterparty"], "phone": t.get("counterparty_phone"), "email": t.get("counterparty_email")})
-    # one entry per person: someone paid by phone once and by email once is still one contact
-    people: dict[str, dict[str, Any]] = {}
+        e = (t.get("counterparty_email") or "").lower()
+        if t.get("direction") == "out" and t.get("counterparty") and e and config.settings.email_allowed(e):
+            seen.setdefault(e, {"name": t["counterparty"], "email": e, "phone": None})
+    people: dict[str, dict[str, Any]] = {}  # one entry per person
     for c in seen.values():
-        p = people.setdefault((c.get("name") or c.get("email") or c.get("phone") or "").strip().lower(), dict(c))
-        p["phone"] = p.get("phone") or c.get("phone")
-        p["email"] = p.get("email") or c.get("email")
+        people.setdefault((c.get("name") or c["email"]).strip().lower(), dict(c))
     return list(people.values())
 
 
@@ -677,13 +697,13 @@ def offline_turn(session_id: str, text: str, _hinted: bool = False) -> dict[str,
     low = text.lower()
     email = (EMAIL_RE.search(text) or [None])[0] if EMAIL_RE.search(text) else None
     phone_m = PHONE_RE.search(EMAIL_RE.sub(" ", text))
-    phone = phone_m.group(1).strip() if phone_m else None
+    phone = phone_m.group(1).strip() if phone_m else None  # only to say PayMinute doesn't pay phone numbers
     contact = None
-    if not email and not phone:
+    if not email:
         contact = intent_mod.contact_name(text, _contacts())
         if contact:
-            phone, email = contact.get("phone"), None if contact.get("phone") else contact.get("email")
-    receiver = email or phone
+            email = contact.get("email")
+    receiver = email
     navigate = None
     who_name = contact["name"] if contact else None
     amount = _amount(text)
@@ -714,7 +734,7 @@ def offline_turn(session_id: str, text: str, _hinted: bool = False) -> dict[str,
             share = round(amount / (len(people) + 1), 2)
             what = _strip_entities(re.sub(r"\b(split|halves|share|divide|between|the|bill|with|me|and|go|on)\b", " ", text, flags=re.I),
                                    *[p.get("name") or "" for p in people]) or "Shared bill"
-            sent, skipped = [], []
+            sent, skipped, queued, failed = [], [], [], []
             for person in people:
                 if not person.get("email"):
                     skipped.append(person["name"])
@@ -726,16 +746,21 @@ def offline_turn(session_id: str, text: str, _hinted: bool = False) -> dict[str,
                                "unit_amount": {"currency_code": cur, "value": f"{share:.2f}"}}]})
                 inv = _invoice_id_from(created)
                 if inv:
-                    call("send_invoice", {"invoice_id": inv, "send_to_recipient": True})
-                    sent.append(person["name"].split()[0])
+                    res = call("send_invoice", {"invoice_id": inv, "send_to_recipient": True})
+                    (queued if isinstance(res, dict) and res.get("status") == "awaiting_user_approval"
+                     else failed if isinstance(res, dict) and res.get("error") else sent).append(person["name"].split()[0])
+                else:
+                    failed.append(person["name"].split()[0])
             reply = (f"Split {amount:,.2f} {cur} {len(people) + 1} ways: {share:,.2f} each. "
-                     + (f"I prepared PayPal invoices for {', '.join(sent)}; approve the cards to send them." if sent else "")
+                     + (f"PayPal emailed an invoice for {share:,.2f} {cur} to {', '.join(sent)}." if sent else "")
+                     + (f" Approve the card to send {', '.join(queued)}'s invoice." if queued else "")
+                     + (f" PayPal couldn't create or send the invoice for {', '.join(failed)}." if failed else "")
                      + (f" No PayPal email for {', '.join(skipped)}." if skipped else ""))
     elif (SELL_WORDS.search(low) or intent == "sell" and confidence > 0.5) and amount and not SHOP_WORDS.search(low):
         from .. import market
-        payee = user.get("phone") or user.get("email")
+        payee = (user.get("email") or "").lower() if config.settings.email_allowed(user.get("email")) else None
         if not payee:
-            reply = "Add your phone or PayPal email in the account menu first, so buyers can pay you."
+            reply = f"Add your PayPal sandbox email ({config.settings.email_rule}) on the Sell page first, so buyers can pay you."
         else:
             req = market.parse_request(text)
             title = req["title"] or re.sub(r"\s+", " ", TITLE_NOISE.sub(" ", _strip_entities(text))).strip(" .,:-").title() or "Item"
@@ -833,32 +858,18 @@ def offline_turn(session_id: str, text: str, _hinted: bool = False) -> dict[str,
                      "Approve the card below to email it.")
         else:
             reply = f"PayPal didn't create the invoice: {created}"
-    elif receiver and amount and SAFETY_Q.search(low) and not (phone and not email):
+    elif phone and not email and not contact:
+        reply = (f"PayMinute pays PayPal emails only, not phone numbers. Give me the person's PayPal email "
+                 f"({config.settings.email_rule}), e.g. “Send $20 to priya@personal.example.com for lunch”.")
+    elif receiver and amount and SAFETY_Q.search(low):
         r = call("check_payment_risk", {"receiver": receiver, "amount": amount})
         lines = "\n".join(f"- **{x['label']}**: {x['detail']}" for x in r.get("reasons", [])) or "- No warning signs."
         reply = (f"Risk level **{r.get('level', '?').upper()}** (score {r.get('score')}).\n{lines}\n\n{r.get('recommendation')}"
                  "\n\n_I haven't prepared any payment. Say “send …” if you want to go ahead._")
-    elif phone and not email and (SAFETY_Q.search(low) or not (amount and SEND_INTENT.search(low))):
-        v = call("verify_phone", {"receiver": phone, "amount": amount})
-        reply = _phone_line(v)
-        if amount and v.get("valid"):
-            r = call("check_payment_risk", {"receiver": phone, "amount": amount})
-            lines = "\n".join(f"- **{x['label']}**: {x['detail']}" for x in r.get("reasons", [])) or "- No warning signs."
-            reply += f"\n\nPayment risk for {amount:,.2f} {cur}: **{r.get('level', '?').upper()}**\n{lines}\n\n{r.get('recommendation')}"
     elif receiver and amount and SEND_INTENT.search(low):
         note_m = re.search(r"\bfor\s+(.+)$", PHONE_RE.sub("", EMAIL_RE.sub("", text)), re.I)
         note = note_m.group(1).strip(" .") if note_m else None
         pre = ""
-        if phone and not email:
-            v = call("verify_phone", {"receiver": phone, "amount": amount})
-            pre = _phone_line(v) + "\n\n"
-            if not v.get("valid") or not v.get("payable"):
-                reply = pre + ("I didn't prepare the payment. " + (
-                    "Check the number and include the country code." if not v.get("valid") else
-                    "PayPal can only deliver to this number once it's linked to a PayPal account: ask them to log in "
-                    "to PayMinute with PayPal, or give me their PayPal email."))
-                db.add_agent_message(session_id, {"role": "assistant", "content": reply})
-                return {"reply": reply, "steps": steps, "pending_actions": [], "mode": "offline"}
         r = call("check_payment_risk", {"receiver": receiver, "amount": amount, "note": note})
         call("send_money", {"receiver": receiver, "amount": amount, "note": note})
         reasons = "; ".join(x["label"] for x in r.get("reasons", [])[:3]) or "no warning signs"
@@ -866,9 +877,9 @@ def offline_turn(session_id: str, text: str, _hinted: bool = False) -> dict[str,
         shown = (f"{rec['name']} ({rec['display']})" if rec.get("name") else rec.get("display")) or receiver
         reply = (f"{pre}Risk check: **{r.get('level', '?').upper()}** ({reasons}). {r.get('recommendation', '')} "
                  f"I've prepared the payout of {amount:,.2f} {cur} to {shown}. Review and approve the card to send it.")
-    elif amount and SEND_INTENT.search(low) and re.search(r"\d{3,}", PHONE_RE.sub(" ", text).replace(str(int(amount)), "", 1)):
-        reply = ("I couldn't find a valid phone number or PayPal email to pay. Include the country code, "
-                 "e.g. “Send $20 to +1 408 555 0134”.")
+    elif amount and SEND_INTENT.search(low) and not receiver:
+        reply = (f"Who should I pay? Give me their PayPal email ({config.settings.email_rule}), "
+                 "e.g. “Send $20 to priya@personal.example.com”.")
     elif re.search(r"\b(pending|stuck|where is|not received|didn'?t arrive|status|unclaimed|on hold|held)\b", low):
         items = call("get_payments_in_progress", {})
         if not items:
@@ -925,15 +936,15 @@ def offline_turn(session_id: str, text: str, _hinted: bool = False) -> dict[str,
     elif not _hinted and intent in HINTS and confidence > 0.25:
         return offline_turn(session_id, f"{text} {HINTS[intent]}", _hinted=True)
     elif intent in {"send", "risk", "schedule", "negotiate", "job_create"} and confidence > 0.25 and not (receiver and amount):
-        missing = "who to pay (a phone number, PayPal email or the name of someone you've paid)" if not receiver else "the amount"
-        reply = f"Sure. Tell me {missing}, e.g. “Pay +1 408 555 0134 $25 for lunch”."
+        missing = "who to pay (their PayPal email or the name of someone you've paid)" if not receiver else "the amount"
+        reply = f"Sure. Tell me {missing}, e.g. “Pay priya@personal.example.com $25 for lunch”."
     else:
         reply = ("I can help with things like:\n- “Where did my money go this month?”\n- “Which payments are stuck?”\n"
-                 "- “Verify +1 408 555 0134”\n- “Send $120 to +1 408 555 0134 for the landing page”\n"
+                 "- “Is priya@personal.example.com safe to pay $50?”\n- “Send $120 to priya@personal.example.com for the landing page”\n"
                  "- “Is it safe to send $400 to someone@example.com?”\n"
                  "- “Invoice maya@example.com $250 for logo design”\n- “How are my budgets?”\n"
-                 "- “Create job logo design for +1 408 555 0134 for $150”, then “the logo job is done”\n"
-                 "- “Pay +1 408 555 0134 $50 every Friday”\n- “Negotiate a logo from +1 408 555 0134, budget $300”\n"
+                 "- “Create job logo design for priya@personal.example.com for $150”, then “the logo job is done”\n"
+                 "- “Pay priya@personal.example.com $50 every Friday”\n- “Negotiate a logo from priya@personal.example.com, budget $300”\n"
                  "- “Buy a camera under $280”, “Sell my bike for $150”, “Split $90 dinner with Priya and Sam”\n\n"
                  "_I run on PayMinute's built-in planner with PayPal's Agent Toolkit and MCP server tools, so I understand requests like these._")
     db.add_agent_message(session_id, {"role": "assistant", "content": reply})

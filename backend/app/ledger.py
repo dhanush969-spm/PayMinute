@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import config, db
-from .ai import categorize, phone as phone_ai, risk, status as status_ai
+import re
+
+from .ai import categorize, risk, status as status_ai
 from .paypal import service as pp
 from .paypal.client import PayPalError
 
@@ -33,48 +35,46 @@ def _risk_fields(assessment: dict[str, Any]) -> dict[str, Any]:
     return {"risk_score": assessment["score"], "risk_level": assessment["level"], "risk_reasons": assessment["reasons"]}
 
 
+PHONE_LIKE = re.compile(r"^\+?[\d\s().-]{7,}$")
+
+
 def resolve_receiver(receiver: str) -> dict[str, Any]:
-    """Phone number (paid to its linked PayPal account) or PayPal email."""
-    r = (receiver or "").strip()
-    if phone_ai.looks_like_phone(r):
-        e164 = phone_ai.normalize(r)
-        if not e164:
-            raise FlowError("That phone number isn't valid. Include the country code, e.g. +1 408 555 0123.")
-        # the sandbox can't pay a raw phone number, so pay the linked PayPal account
-        link = db.find_phone(e164)
-        if link and link.get("email"):
-            return {"type": "EMAIL", "value": link["email"], "email": link["email"], "phone": e164,
-                    "name": link.get("name"), "display": e164}
-        if link:
-            return {"type": "PAYPAL_ID", "value": link["payer_id"], "email": None, "phone": e164,
-                    "name": link.get("name"), "display": e164}
-        return {"type": "PHONE_UNLINKED", "value": e164, "email": None, "phone": e164, "name": None, "display": e164}
-    if "@" in r and "." in r.split("@")[-1]:
-        return {"type": "EMAIL", "value": r.lower(), "email": r.lower(), "phone": None, "name": None, "display": r.lower()}
-    raise FlowError("Enter the recipient's phone number (with country code) or PayPal email.")
+    """A PayPal sandbox email (…@personal.example.com). PayMinute doesn't pay phone numbers."""
+    r = (receiver or "").strip().lower()
+    rule = config.settings.email_rule
+    if "@" not in r and PHONE_LIKE.match(r):
+        raise FlowError(f"PayMinute pays PayPal emails only, not phone numbers. Use the person's PayPal email ({rule}).")
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", r):
+        raise FlowError(f"Enter the recipient's PayPal email ({rule}).")
+    if not config.settings.email_allowed(r):
+        raise FlowError(f"Only PayPal sandbox emails ending in {rule.replace('…', '')} can be paid.")
+    known = db.find_email(r)
+    return {"type": "EMAIL", "value": r, "email": r, "phone": None, "name": (known or {}).get("name"), "display": r,
+            "on_payminute": bool(known)}
+
+
+def email_check(who: dict[str, Any]) -> dict[str, Any]:
+    """What PayMinute knows about a recipient's PayPal email (shown before paying)."""
+    known = db.find_email(who["email"])
+    if known:
+        return {"status": "on_payminute", "label": f"{known['name'] or 'PayMinute user'}'s PayPal email", "name": known["name"],
+                "detail": ("PayPal shared this email when they logged in to PayMinute with PayPal."
+                           if known["source"] == "paypal" else "They added it as their PayPal email in PayMinute.")}
+    return {"status": "sandbox", "label": "PayPal sandbox email", "name": None,
+            "detail": "A PayPal sandbox personal account. PayPal delivers the payout to it, or it waits as unclaimed if "
+                      "no account uses this email yet."}
 
 
 def assess_payout(receiver: str, amount: float, note: str | None, name: str | None = None) -> dict[str, Any]:
     who = resolve_receiver(receiver)
     hist = history()
-    phone_check = None
-    extra: list[dict[str, Any]] = []
-    if who["phone"]:
-        phone_check = phone_ai.analyze(who["phone"], hist, amount)
-        extra = phone_check["signals"]
-        name = name or phone_check["paypal"].get("name")
+    name = name or who.get("name")
     assessment = risk.assess("out", amount, who["email"], name, note, hist,
-                             counterparty_phone=who["phone"], extra_reasons=extra,
-                             verified_identity=bool(phone_check and phone_check["paypal"]["status"] == "verified"))
-    if phone_check and phone_check["level"] == "high" and assessment["level"] != "high":
-        # a high-risk number blocks the payment
-        assessment["level"] = "high"
-        assessment["score"] = max(assessment["score"], 0.6)
-        assessment["recommendation"] = risk.recommendation("out", "high", assessment["reasons"])
+                             verified_identity=bool(who.get("on_payminute")))
     category, _ = categorize.categorize_one("out", name or who["display"], who["display"], note)
     assessment["suggested_category"] = category
     assessment["recipient"] = who
-    assessment["phone_check"] = phone_check
+    assessment["email_check"] = email_check(who)
     return assessment
 
 
@@ -91,20 +91,17 @@ def send_payout(receiver: str, amount: float, note: str | None, name: str | None
 
     assessment = assess_payout(receiver, amount, note, name)
     who = assessment["recipient"]
-    if who["type"] == "PHONE_UNLINKED":
-        raise FlowError("This number isn't linked to a PayPal account yet, so PayPal can't deliver to it. Ask them to log "
-                        "in to PayMinute with PayPal once, or pay their PayPal email.", 422, {"phone_check": assessment["phone_check"]})
     if assessment["level"] == "high" and not acknowledge_risk:
         raise FlowError("High risk payment needs your explicit confirmation.", 409, {"risk": assessment})
 
     name = name or who.get("name")
-    display = name or (assessment.get("phone_check") or {}).get("display") or who["display"]
+    display = name or who["display"]
     category, cat_source = categorize.categorize_one("out", name or who["display"], who["display"], note)
     tx = db.insert_tx({
         "kind": "payout", "direction": "out", "amount": round(amount, 2), "counterparty": display,
-        "counterparty_email": who["email"], "counterparty_phone": who["phone"], "memo": note, "category": category,
+        "counterparty_email": who["email"], "counterparty_phone": None, "memo": note, "category": category,
         "category_source": cat_source, "status": "PENDING", "request_id": client_ref, "source": source,
-        "counterparty_account": _other_account(who.get("phone"), who.get("email")),
+        "counterparty_account": _other_account(who.get("email")),
         **_risk_fields(assessment),
     })
     try:
@@ -182,10 +179,9 @@ def cancel_unclaimed(tx_id: str) -> dict[str, Any]:
                        status_reason="CANCELLED_BY_SENDER", _source="user")  # type: ignore[return-value]
 
 
-def _other_account(phone: str | None, email: str | None) -> str | None:
+def _other_account(email: str | None) -> str | None:
     """The other side's PayMinute account (if they've logged in), so the payment shows up for them too."""
-    link = db.find_phone(phone) if phone else None
-    other = (link or {}).get("payer_id") or db.account_for_email(email)
+    other = db.account_for_email(email)
     return other if other and other != db.current_account() else None
 
 
@@ -234,7 +230,7 @@ def complete_checkout(order_id: str) -> dict[str, Any]:
     category, cat_source = categorize.categorize_one("in", payer["name"], payer["email"], tx.get("memo"))
     db.update_tx(tx["id"], counterparty=payer["name"], counterparty_email=(payer["email"] or "").lower() or None,
                  counterparty_country=payer["country"], paypal_authorization_id=auth.get("id"),
-                 counterparty_account=_other_account(None, payer["email"]),
+                 counterparty_account=_other_account(payer["email"]),
                  status="AUTHORIZED", category=category if cat_source != "default" else tx["category"],
                  category_source=cat_source if cat_source != "default" else tx["category_source"], _source="paypal")
     assessment = risk.assess("in", tx["amount"], payer["email"], payer["name"], tx.get("memo"), history(),

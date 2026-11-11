@@ -1,6 +1,6 @@
 """Payment agents that act on the user's behalf: job payouts, scheduled payments and agent-to-agent deals.
 
-Every agent payment goes through the same checks as a manual one (phone verification, risk score,
+Every agent payment goes through the same checks as a manual one (PayPal sandbox email only, risk score,
 duplicate check) plus spending limits. Low-risk payments inside the limits are sent automatically;
 anything else waits for the user's approval.
 """
@@ -159,10 +159,7 @@ def pay(agent: str, ref: str, payee: str, amount: float, note: str, name: str | 
         return {"outcome": "blocked", "summary": str(exc), "risk": None}
     who = check["recipient"]
     shown = name or who.get("name") or who.get("display")
-    phone = check.get("phone_check")
     reasons: list[str] = []
-    if who["type"] == "PHONE_UNLINKED":
-        reasons.append("the number isn't linked to a PayPal account")
     if not approved:
         if not cfg["enabled"]:
             reasons.append("automatic payments are paused")
@@ -173,11 +170,10 @@ def pay(agent: str, ref: str, payee: str, amount: float, note: str, name: str | 
         if check["level"] == "high" or (check["level"] == "medium" and not cfg["allow_medium_risk"]):
             reasons.append(f"the risk check says {check['level']} ({', '.join(r['label'] for r in check['reasons'][:3])})")
     if reasons:
-        blocked = who["type"] == "PHONE_UNLINKED"
-        outcome = "blocked" if blocked else "needs_approval"
+        outcome = "needs_approval"
         summary = f"Didn't pay {amount:.2f} to {shown}: " + "; ".join(reasons) + "."
         _log(agent, ref, outcome, summary)
-        return {"outcome": outcome, "summary": summary, "risk": _risk_brief(check), "phone": phone}
+        return {"outcome": outcome, "summary": summary, "risk": _risk_brief(check)}
     try:
         res = ledger.send_payout(payee, amount, note, name, client_ref=f"{agent}-{ref}"[:64],
                                  acknowledge_risk=True, source="agent")
@@ -198,7 +194,7 @@ def _risk_brief(check: dict[str, Any]) -> dict[str, Any]:
 def create_job(title: str, payee: str, amount: float, payee_name: str | None = None) -> dict[str, Any]:
     if amount <= 0:
         raise ledger.FlowError("Amount must be greater than zero.")
-    ledger.resolve_receiver(payee)  # validates the phone / email early
+    ledger.resolve_receiver(payee)  # a PayPal sandbox email, or this raises
     job = {"id": db.new_id("job_"), "title": title.strip()[:120], "payee": payee.strip(), "payee_name": payee_name,
            "amount": round(amount, 2), "status": "open", "detail": None, "transaction_id": None,
            "created_at": db.now_iso(), "completed_at": None, "owner_account": db.current_account()}
@@ -417,11 +413,28 @@ class SellerAgent:
 
 def bargain_steps(buyer: BuyerAgent, seller: SellerAgent, item: str, max_rounds: int = 10):
     """Yield each message as the agents trade offers; the last yielded value is ("result", price or None)."""
-    yield {"agent": "seller", "action": "ask", "amount": seller.ask, "text": f"{item}: {seller.ask:.2f}."}
+    history: list[dict[str, Any]] = []  # both agents read the conversation so far (used by the Gemini agents)
+    for agent in (buyer, seller):
+        if hasattr(agent, "history"):
+            agent.history = history
+
+    def said(msg: dict[str, Any], agent: Any = None) -> dict[str, Any]:
+        if agent is not None:
+            if getattr(agent, "last_by", None):
+                msg["by"] = agent.last_by  # "gemini" or "rules"
+            if getattr(agent, "last_note", None):
+                msg["note"] = agent.last_note
+            if agent is buyer and getattr(agent, "last_thinking", None):
+                msg["thinking"] = agent.last_thinking  # only the user's own agent shows its reasoning
+        history.append(msg)
+        return msg
+
+    opening = seller.opening(item) if hasattr(seller, "opening") else f"{item}: {seller.ask:.2f}."
+    yield said({"agent": "seller", "action": "ask", "amount": seller.ask, "text": opening}, seller)
     ask = seller.ask
     for rnd in range(1, max_rounds + 1):
         act, value, text = buyer.respond(ask, rnd)
-        yield {"agent": "buyer", "action": act, "amount": value, "text": text}
+        yield said({"agent": "buyer", "action": act, "amount": value, "text": text}, buyer)
         if act == "accept":
             yield ("result", value)
             return
@@ -429,7 +442,7 @@ def bargain_steps(buyer: BuyerAgent, seller: SellerAgent, item: str, max_rounds:
             yield ("result", None)
             return
         act, value, text = seller.respond(value, rnd)
-        yield {"agent": "seller", "action": act, "amount": value, "text": text}
+        yield said({"agent": "seller", "action": act, "amount": value, "text": text}, seller)
         if act == "accept":
             yield ("result", value)
             return
@@ -457,8 +470,9 @@ def negotiate(item: str, seller: str, budget: float, list_price: float | None = 
     ledger.resolve_receiver(seller)
     list_price = list_price or round(budget * 1.25, 2)
     floor = floor if floor is not None else round(list_price * 0.7, 2)
-    sell = SellerAgent(list_price, floor)
-    transcript, price = bargain(BuyerAgent(budget), sell, item, max_rounds)
+    from .ai import negotiator  # Google Gemini picks the moves when GEMINI_API_KEY is set
+    sell = negotiator.make_seller(list_price, floor, item={"title": item})
+    transcript, price = bargain(negotiator.make_buyer(budget, item={"title": item}), sell, item, max_rounds)
     if price is None:
         summary = f"No deal on {item}: the seller wouldn't go under {sell.ask:.2f} and your budget is {budget:.2f}."
         _log("deal", item, "no_deal", summary)

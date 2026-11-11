@@ -1,4 +1,4 @@
-// First letter on a colour picked from the person's phone/email, so it stays the same.
+// First letter on a colour picked from the person's email, so it stays the same.
 import { Phone } from "lucide-react";
 
 const COLORS = [
