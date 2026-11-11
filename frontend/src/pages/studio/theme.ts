@@ -1,0 +1,87 @@
+// Studio theme mapped to the app's CSS variables
+import { studioTheme } from "ag-studio";
+
+const v = (name: string) => `var(--${name})`;
+const line = (name: string) => ({ width: 1, color: v(name) });
+const palette = Object.fromEntries(
+  Array.from({ length: 8 }, (_, i) => [
+    [`chartPaletteFills${i + 1}Color`, v(`chart-${i + 1}`)],
+    [`chartPaletteStrokes${i + 1}Color`, v(`chart-${i + 1}`)],
+  ]).flat(),
+);
+
+export const payminuteStudioTheme = studioTheme.withParams({
+  fontFamily: v("font"),
+  fontSize: 14,
+  textColor: v("ink"),
+  foregroundColor: v("ink"),
+  subtleTextColor: v("ink-3"),
+  backgroundColor: v("surface"),
+  borderColor: v("line"),
+  accentColor: v("brand"),
+  iconColor: v("ink-2"),
+  rowHoverColor: v("surface-2"),
+
+  studioWrapperBorder: false,
+  studioWrapperBorderRadius: 0,
+  studioWrapperSpacing: 0,
+  studioWrapperBackgroundColor: v("bg"),
+  studioCanvasBorder: false,
+  studioCanvasBorderRadius: 0,
+  studioCanvasShadow: false,
+  studioCanvasBackgroundColor: v("bg"),
+  studioCanvasPadding: 12,
+  studioCanvasRowHeight: 18,
+  studioCanvasFontFamily: v("font"),
+
+  studioWidgetBackgroundColor: v("surface"),
+  studioWidgetBorder: line("line"),
+  studioWidgetBorderRadius: 16,
+  studioWidgetPadding: 12,
+  studioWidgetTitleFontFamily: v("font"),
+  studioWidgetTitleFontSize: 15,
+  studioWidgetTitleFontWeight: 650,
+  studioWidgetTitleTextColor: v("ink"),
+  studioWidgetSubtitleFontFamily: v("font"),
+  studioWidgetSubtitleFontSize: 13,
+  studioWidgetSubtitleTextColor: v("ink-3"),
+  studioWidgetCaptionFontFamily: v("font"),
+  studioWidgetCaptionFontSize: 13,
+  studioWidgetCaptionTextColor: v("ink-3"),
+  studioWidgetResizeBorderColor: v("brand"),
+
+  studioPanelContainerBackgroundColor: v("surface"),
+  studioPanelContainerBorder: line("line"),
+  studioPanelContainerBorderRadius: 0,
+  studioPanelDividerColor: v("line"),
+  studioPanelDividerActiveColor: v("brand"),
+  studioPanelSectionBorderColor: v("line"),
+  studioPanelHeaderFontFamily: v("font"),
+  studioPanelHeaderFontWeight: 600,
+  studioPanelChevronButtonHoverBackgroundColor: v("brand-soft"),
+  studioPanelChevronButtonHoverColor: v("brand-ink"),
+  studioToggleButtonActiveBackgroundColor: v("brand-soft"),
+  studioToggleButtonActiveBorderColor: v("brand"),
+  studioToggleButtonActiveColor: v("brand-ink"),
+
+  gridFontFamily: v("font"),
+  gridFontSize: 14,
+  gridCellTextColor: v("ink"),
+  gridHeaderBackgroundColor: v("surface"),
+  gridHeaderTextColor: v("ink-3"),
+  gridHeaderFontWeight: 600,
+  gridHeaderFontSize: 13,
+  gridRowHeight: 40,
+  gridRowBorder: line("line"),
+  gridHeaderRowBorder: line("line-strong"),
+  gridPinnedRowBorder: line("line"),
+  gridRowHoverColor: v("surface-2"),
+  gridWrapperBorder: false,
+
+  chartFontFamily: v("font"),
+  chartTextColor: v("ink"),
+  chartSubtleTextColor: v("ink-3"),
+  chartAxisLineColor: v("line-strong"),
+  chartGridLineColor: v("line"),
+  ...palette,
+});

@@ -1,0 +1,13 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+requests>=2.31
+pydantic>=2.10
+python-dotenv>=1.0.1
+scikit-learn>=1.5
+numpy>=1.26
+# Optional integrations (safe to keep installed; only used when configured)
+mcp>=1.12,<2
+kernel>=0.14
+phonenumbers>=8.13
+itsdangerous>=2.1
